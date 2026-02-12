@@ -9,6 +9,7 @@
 // Flight Computer SCK  <-> Feather PB09 (Labelled A2)
 // Flight Computer CS   <-> Feather PB10 (Labelled MOSI)
 // Flight Computer MISO <-> Feather PB11 (Labelled SCK)
+// Pressure sensor output <-> Feather PA02 (Labelled A0) (3.3V MAX!)
 
 enum Command {
   SETUP = 1,
@@ -29,7 +30,7 @@ enum State { // From firmware kernel source `ao_flight.h`
   TEST = 10
 };
 
-// Docs are incorrect, the message header is 16 bytes, not 8 bytes.
+// The companion docs are incorrect, the message header is 16 bytes, not 8 bytes.
 // There is some extra data after the flight number (from firmware source)
 typedef struct {
   uint8_t   command;
@@ -61,6 +62,8 @@ AltOSFetchReply fetchReply;
 uint8_t rxIndex = 0;
 uint8_t txIndex = 0;
 volatile bool newMessage = false;
+volatile uint16_t adcValue = 0;
+
 
 void handleStateChange(State oldState, State newState) {
   Serial.printf("State Change: %d -> %d\n", (int)oldState, (int)newState);
@@ -82,9 +85,10 @@ void setup() {
   Serial.printf("Setup reply initialized: %d %d %d %d\n", 
                 setupReply.board_id, setupReply.board_id_inverse, 
                 setupReply.update_period, setupReply.channels);
-
   SPISlave.SercomInit(SPISlave.MOSI_Pins::PA12, SPISlave.SCK_Pins::PB09, SPISlave.SS_Pins::PB10, SPISlave.MISO_Pins::PB11);
   Serial.println("SERCOM4 SPI slave initialized");
+  init_adc();
+  Serial.println("ADC Initialized");
 }
 
 void loop() {
@@ -94,8 +98,64 @@ void loop() {
     Serial.printf("%d %d %d %d %d %d %d %d %d\n\n", message.command, message.flight_state, message.tick, 
                                                     message.serial, message.flight, message.accel, message.speed, 
                                                     message.height, message.motor_number);
+    Serial.println(adcValue);
     newMessage = false;
   }
+}
+
+void init_adc() {
+  // Configure I/O port - PA02 is PINCFG[2], PMUX[1].PMUXE
+  PORT->Group[PORTA].DIRCLR.reg = PORT_PA02;
+  PORT->Group[PORTA].PINCFG[2].bit.PMUXEN = 0x1; // Enable pin PA02
+  PORT->Group[PORTA].PMUX[1].bit.PMUXE = 0x1; // Select peripheral function B (ADC input)
+
+  // Reset ADC
+  ADC->CTRLA.bit.ENABLE = 0x0;
+  while (ADC->STATUS.bit.SYNCBUSY);
+  ADC->CTRLA.bit.SWRST = 0x1;
+  while (ADC->CTRLA.bit.SWRST || ADC->STATUS.bit.SYNCBUSY);
+
+  // Configure ADC
+  GCLK->CLKCTRL.reg = GCLK_CLKCTRL_ID(GCM_ADC) | // Enable ADC clock
+                      GCLK_CLKCTRL_ID_ADC |
+                      GCLK_CLKCTRL_CLKEN;
+  NVIC_EnableIRQ(ADC_IRQn); // Enable interrupt handler
+  NVIC_SetPriority(ADC_IRQn, 1);
+  while (GCLK->STATUS.reg & GCLK_STATUS_SYNCBUSY); // Wait for synchronisation
+
+  // Load the factory calibration data
+  // Code from https://blog.thea.codes/reading-analog-values-with-the-samd-adc/
+  uint32_t bias = (*((uint32_t *) ADC_FUSES_BIASCAL_ADDR) & ADC_FUSES_BIASCAL_Msk) >> ADC_FUSES_BIASCAL_Pos;
+  uint32_t linearity = (*((uint32_t *) ADC_FUSES_LINEARITY_0_ADDR) & ADC_FUSES_LINEARITY_0_Msk) >> ADC_FUSES_LINEARITY_0_Pos;
+  linearity |= ((*((uint32_t *) ADC_FUSES_LINEARITY_1_ADDR) & ADC_FUSES_LINEARITY_1_Msk) >> ADC_FUSES_LINEARITY_1_Pos) << 5;
+  while (ADC->STATUS.bit.SYNCBUSY);
+
+  ADC->CALIB.reg = ADC_CALIB_BIAS_CAL(bias) | ADC_CALIB_LINEARITY_CAL(linearity);
+  ADC->INPUTCTRL.bit.GAIN   = 0xF; // DIV2 gain due to voltage reference being 1/2 VCC
+  ADC->INPUTCTRL.bit.MUXNEG = 0x18; // Internal ground as negative input
+  ADC->INPUTCTRL.bit.MUXPOS = 0x00; // PA02 (AIN0) as positive input
+  ADC->INTENSET.bit.RESRDY  = 0x1; // Enable result ready interrupt
+  ADC->REFCTRL.bit.REFCOMP  = 0x1; // Enable voltage reference compensation
+  ADC->REFCTRL.bit.REFSEL   = 0x2; // 3.3V Reference (1/2 VCC = 1.65V)
+  ADC->CTRLB.bit.PRESCALER  = 0x6; // Prescaler 256
+  ADC->CTRLB.bit.RESSEL     = 0x0; // 12-bit resolution mode
+                                   // NOTE: Even though there is time for 16 bit oversampling, 
+                                   // the signal may change rapidly and might be inaccurate that way.
+  ADC->CTRLB.bit.CORREN     = 0x0; // Disable digital correction
+  // ADC->CTRLB.bit.FREERUN    = 0x0; // One-shot conversion mode
+  ADC->CTRLB.bit.FREERUN    = 0x1; // Freerun conversion mode
+  ADC->CTRLB.bit.DIFFMODE   = 0x0; // Single-ended conversion
+  ADC->AVGCTRL.bit.SAMPLENUM = 0x1; // Average 2 samples
+  ADC->AVGCTRL.bit.ADJRES   = 0x1; // Divisor of 2 (for 2 samples)
+
+  // Re-enable ADC
+  ADC->CTRLA.bit.ENABLE = 0x1;
+  while (ADC->STATUS.bit.SYNCBUSY);
+}
+
+void ADC_Handler() {
+  // With prescaler 256, freerun mode, 2 sample average, conversion takes ~110us
+  adcValue = ADC->RESULT.reg; // This will clear the INTFLAG.RESRDY interrupt flag
 }
 
 void SERCOM4_Handler()
