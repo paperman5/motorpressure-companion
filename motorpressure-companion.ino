@@ -3,7 +3,7 @@
 #define CHANNELS 10
 #define BOARD_ID 0x7
 #define UPDATE_RATE 100 // 100Hz ticks
-#define SAMPLE_RATE 10 // ADC sample rate in milliseconds
+#define ADC_RATE 4 // 50kHz increments, min 1, max 5
 
 // WIRING (Adafruit Feather M0 Adalogger)
 // Flight Computer MOSI <-> Feather PA12 (Labelled MISO)
@@ -62,9 +62,11 @@ AltOSSetupReply setupReply;
 volatile AltOSFetchReply fetchReply;
 uint8_t rxIndex = 0;
 uint8_t txIndex = 0;
-volatile uint8_t adcIndex = 0;
+volatile unsigned long adcIndex = 0;
 volatile uint16_t adcSamples[CHANNELS];
 volatile bool newMessage = false;
+unsigned long prevTime = 0;
+unsigned long diffTime = 0;
 
 
 /****** MAIN PROGRAM ******/
@@ -82,7 +84,6 @@ void setup() {
   for (int i = 0; i < CHANNELS; i++) {
     fetchReply.data[i] = i;
   }
-  // memset(&adcSamples, 0, sizeof(adcSamples));
   Serial.printf("Setup reply initialized: %d %d %d %d\n", 
                 setupReply.board_id, setupReply.board_id_inverse, 
                 setupReply.update_period, setupReply.channels);
@@ -92,8 +93,9 @@ void setup() {
   Serial.println("SERCOM4 SPI slave initialized");
   init_adc();
   Serial.println("ADC Initialized");
-  init_timer();
+  init_adc_timer();
   Serial.println("Timer Initialized");
+  // TODO: Setup brownout detector?
 }
 
 void loop() {
@@ -105,31 +107,32 @@ void loop() {
                                                     message.height, message.motor_number);
     newMessage = false;
   }
+  if (adcIndex >= 50000 * ADC_RATE) {
+    unsigned long t = micros();
+    Serial.printf("%d: %d\n", adcIndex, t - prevTime);
+    prevTime = t;
+    adcIndex = 0;
+  }
 }
 
 /****** PERIPHERAL REGISTER INITIALIZATION ******/
 
 void init_clocks() {
-  // Generic clock 0, used for companion SPI connection (SERCOM4)
-  // Setup with 8Mhz oscillator, no division
-  // NOTE: Not sure why, but touching this crashes the system. Leave it alone.
-  // GCLK->GENDIV.reg = GCLK_GENDIV_ID(0) | GCLK_GENDIV_DIV(0);
-  // while (GCLK->STATUS.reg & GCLK_STATUS_SYNCBUSY);
-  // GCLK->GENCTRL.reg = GCLK_GENCTRL_GENEN | GCLK_GENCTRL_SRC_OSC8M | GCLK_GENCTRL_ID(0);
-  // while (GCLK->STATUS.reg & GCLK_STATUS_SYNCBUSY);
+  // Generic clock 0, is used for companion SPI connection (SERCOM4)
+  // GCLK0 is also the main system clock so we don't change it or it will crash
 
   // Generic clock 1, used for ADC clock
-  // Setup with 8Mhz oscillator, no division
-  GCLK->GENDIV.reg = GCLK_GENDIV_ID(1) | GCLK_GENDIV_DIV(0);
+  // Setup with 48Mhz oscillator, divided by 3 for 16Mhz
+  GCLK->GENDIV.reg = GCLK_GENDIV_ID(1) | GCLK_GENDIV_DIV(3);
   while (GCLK->STATUS.reg & GCLK_STATUS_SYNCBUSY);
-  GCLK->GENCTRL.reg = GCLK_GENCTRL_GENEN | GCLK_GENCTRL_SRC_OSC8M | GCLK_GENCTRL_ID(1);
+  GCLK->GENCTRL.reg = GCLK_GENCTRL_GENEN | GCLK_GENCTRL_SRC_DFLL48M | GCLK_GENCTRL_ID(1);
   while (GCLK->STATUS.reg & GCLK_STATUS_SYNCBUSY);
 
-  // Generic clock 2, used for Timer clock (RTC)
-  // Setup with 8Mhz oscillator, no division
-  GCLK->GENDIV.reg = GCLK_GENDIV_ID(2) | GCLK_GENDIV_DIV(0);
+  // Generic clock 2, used for Timer clock (TC5)
+  // Setup with 48Mhz oscillator, divided by 3 for 16Mhz
+  GCLK->GENDIV.reg = GCLK_GENDIV_ID(2) | GCLK_GENDIV_DIV(3);
   while (GCLK->STATUS.reg & GCLK_STATUS_SYNCBUSY);
-  GCLK->GENCTRL.reg = GCLK_GENCTRL_GENEN | GCLK_GENCTRL_SRC_OSC8M | GCLK_GENCTRL_ID(2);
+  GCLK->GENCTRL.reg = GCLK_GENCTRL_GENEN | GCLK_GENCTRL_SRC_DFLL48M | GCLK_GENCTRL_ID(2);
   while (GCLK->STATUS.reg & GCLK_STATUS_SYNCBUSY);
 }
 
@@ -146,8 +149,8 @@ void init_adc() {
   while (ADC->CTRLA.bit.SWRST || ADC->STATUS.bit.SYNCBUSY);
 
   // Configure ADC
-  GCLK->CLKCTRL.reg = GCLK_CLKCTRL_ID(GCM_ADC) | // Enable ADC clock
-                      GCLK_CLKCTRL_GEN_GCLK1 |
+  GCLK->CLKCTRL.reg = GCLK_CLKCTRL_ID(GCM_ADC) |  // Enable ADC clock
+                      GCLK_CLKCTRL_GEN_GCLK1 |    // Use 16MHz GCLK1
                       GCLK_CLKCTRL_CLKEN;
   NVIC_EnableIRQ(ADC_IRQn); // Enable interrupt handler
   NVIC_SetPriority(ADC_IRQn, 1);
@@ -166,72 +169,97 @@ void init_adc() {
   ADC->INPUTCTRL.bit.MUXPOS = 0x00; // PA02 (AIN0) as positive input
   ADC->INTENSET.bit.RESRDY  = 0x1; // Enable result ready interrupt
   ADC->REFCTRL.bit.REFCOMP  = 0x1; // Enable voltage reference compensation
-  ADC->REFCTRL.bit.REFSEL   = 0x2; // 3.3V Reference (1/2 VCC = 1.65V)
-  ADC->CTRLB.bit.PRESCALER  = 0x3; // Prescaler 32
+  ADC->REFCTRL.bit.REFSEL   = 0x2; // 1.65V Reference (1/2 VCC)
+  ADC->CTRLB.bit.PRESCALER  = 0x1; // Prescaler 8
+                                   // NOTE: Max ADC clock is ~2.1MHz, use DIV8 to get 2.0MHz (48/3/8)
+                                   // ALSO NOTE: Max measurement impedance is ~4.5MOhm
+                                   // https://blog.thea.codes/getting-the-most-out-of-the-samd21-adc/
   ADC->CTRLB.bit.RESSEL     = 0x0; // 12-bit resolution mode
-                                   // NOTE: Even though there is time for 16 bit oversampling, 
-                                   // the signal may change rapidly and might be inaccurate that way.
   ADC->CTRLB.bit.CORREN     = 0x0; // Disable digital correction
-  ADC->CTRLB.bit.FREERUN    = 0x0; // One-shot conversion mode
+  ADC->CTRLB.bit.FREERUN    = 0x0; // One-shot conversion mode (Triggered from timer)
   // ADC->CTRLB.bit.FREERUN    = 0x1; // Freerun conversion mode
   ADC->CTRLB.bit.DIFFMODE   = 0x0; // Single-ended conversion
-  ADC->AVGCTRL.bit.SAMPLENUM = 0x1; // Average 2 samples
-  ADC->AVGCTRL.bit.ADJRES   = 0x1; // Divisor of 2 (for 2 samples)
+  // ADC->AVGCTRL.bit.SAMPLENUM = 0x1; // Average 2 samples
+  // ADC->AVGCTRL.bit.ADJRES   = 0x1; // Divisor of 2 (for 2 samples)
 
   // Re-enable ADC
   ADC->CTRLA.bit.ENABLE = 0x1;
   while (ADC->STATUS.bit.SYNCBUSY);
 }
 
-void init_timer() {
-  // Clock source is GCLK2, setup with 8Mhz oscillator (see init_clocks)
+void init_adc_timer() {
+  // Clock source is GCLK2, setup with 8Mhz clock (see init_clocks)
   GCLK->CLKCTRL.reg = GCLK_CLKCTRL_CLKEN | 
                       GCLK_CLKCTRL_GEN_GCLK2 | 
-                      GCLK_CLKCTRL_ID(GCM_RTC);
-  // Reset RTC
+                      GCLK_CLKCTRL_ID(GCM_TC4_TC5);
   while (GCLK->STATUS.bit.SYNCBUSY);
-  RTC->MODE0.CTRL.bit.ENABLE = 0x0;
-  while (RTC->MODE0.STATUS.bit.SYNCBUSY);
-  RTC->MODE0.CTRL.bit.SWRST = 0x1;
-  while (RTC->MODE0.STATUS.bit.SYNCBUSY);
+  TC5->COUNT16.CTRLA.bit.ENABLE = 0x0;
+  while (TC5->COUNT16.STATUS.bit.SYNCBUSY);
+  TC5->COUNT16.CTRLA.bit.SWRST = 0x1;
+  while (TC5->COUNT16.STATUS.bit.SYNCBUSY);
 
-  NVIC_EnableIRQ(RTC_IRQn); // Enable interrupts
-  NVIC_SetPriority(RTC_IRQn, 0);
+  NVIC_EnableIRQ(TC5_IRQn);
+  NVIC_SetPriority(TC5_IRQn, 3);
 
-  RTC->MODE0.CTRL.bit.MODE = 0x0;       // Mode 0 (32 bit counter)
-  RTC->MODE0.CTRL.bit.PRESCALER = 0x3;  // DIV8
-  RTC->MODE0.CTRL.bit.MATCHCLR = 0x1;   // Clear timer on compare match (reset to 0)
-  RTC->MODE0.COMP[0].reg = (uint32_t) 1000 * SAMPLE_RATE - 1;
-  // RTC->MODE0.INTENSET.bit.CMP0 = 0x1;   // Compare match interrupt enabled
-                                        // Interrupt is raised on the next clock cycle
-  // RTC->MODE0.FREQCORR.bit.SIGN = 0x1;
-  // RTC->MODE0.FREQCORR.bit.VALUE = 0x7F;
-  RTC->MODE0.CTRL.bit.ENABLE = 0x1;
-  while (RTC->MODE0.STATUS.bit.SYNCBUSY);
+  TC5->COUNT16.CTRLA.bit.MODE = 0x0;        // 16-bit counter
+  TC5->COUNT16.CTRLA.bit.WAVEGEN = 0x1;     // Match frequency generation (CC0 becomes TOP value)
+  TC5->COUNT16.CTRLA.bit.PRESCALER = 0x2;   // DIV4 prescaler for 4MHz clock
+  TC5->COUNT16.CTRLA.bit.PRESCSYNC = 0x0;   // Reset counter on next clock, not next prescaled clock
+  TC5->COUNT16.CTRLBSET.bit.ONESHOT = 0x0;  // Continue counting on wraparound
+  TC5->COUNT16.CTRLBSET.bit.DIR = 0x0;      // Count Up
+  TC5->COUNT16.CC[0].reg = (uint16_t) ((80 / max(1, min(ADC_RATE, 5))) - 1);
+
+  TC5->COUNT16.INTENSET.bit.OVF = 0x1;      // Enable overflow interrupt
+
+  TC5->COUNT16.CTRLA.bit.ENABLE = 0x1;
+  while (TC5->COUNT16.STATUS.bit.SYNCBUSY);
 }
+
+// void init_timer() {
+//   // Clock source is GCLK2, setup with 8Mhz clock (see init_clocks)
+//   GCLK->CLKCTRL.reg = GCLK_CLKCTRL_CLKEN | 
+//                       GCLK_CLKCTRL_GEN_GCLK2 | 
+//                       GCLK_CLKCTRL_ID(GCM_RTC);
+//   while (GCLK->STATUS.bit.SYNCBUSY);
+//   // Reset RTC
+//   RTC->MODE0.CTRL.bit.ENABLE = 0x0;
+//   while (RTC->MODE0.STATUS.bit.SYNCBUSY);
+//   RTC->MODE0.CTRL.bit.SWRST = 0x1;
+//   while (RTC->MODE0.STATUS.bit.SYNCBUSY);
+
+//   NVIC_EnableIRQ(RTC_IRQn); // Enable interrupts
+//   NVIC_SetPriority(RTC_IRQn, 0);
+
+//   RTC->MODE0.CTRL.bit.MODE = 0x0;       // Mode 0 (32 bit counter)
+//   RTC->MODE0.CTRL.bit.PRESCALER = 0x3;  // DIV8
+//   RTC->MODE0.CTRL.bit.MATCHCLR = 0x1;   // Clear timer on compare match (reset to 0)
+//   RTC->MODE0.COMP[0].reg = (uint32_t) 20 * max(1, min(ADC_RATE, 5)) - 1;
+//   RTC->MODE0.INTENSET.bit.CMP0 = 0x1;   // Compare match interrupt enabled
+//                                         // Interrupt is raised on the next clock cycle
+//   // RTC->MODE0.FREQCORR.bit.SIGN = 0x1;
+//   // RTC->MODE0.FREQCORR.bit.VALUE = 0x7F;
+//   RTC->MODE0.CTRL.bit.ENABLE = 0x1;
+//   while (RTC->MODE0.STATUS.bit.SYNCBUSY);
+// }
 
 /****** INTERRUPT HANDLERS ******/
 
-void RTC_Handler() {
-  RTC->MODE0.INTFLAG.bit.CMP0 = 0x1; // Clear the compare match interrupt
-  // TODO: Make sure the RTC is actually ticking at the correct rate.
-  // w/ 8MHz clock and 1s sample rate, it appears to tick at 1003ms. (x1.00259690)
-  // Not sure if that is an issue with the timer setup or something else.
+// void RTC_Handler() {
+//   RTC->MODE0.INTFLAG.bit.CMP0 = 0x1; // Clear the compare match interrupt
+//   // TODO: Make sure the RTC is actually ticking at the correct rate.
+//   // w/ 8MHz clock and 1s sample rate, it appears to tick at 1003ms. (x1.00259690)
+//   // Not sure if that is an issue with the timer setup or calibration.
+// }
 
-  // Trigger an ADC conversion.
-  if (adcIndex < CHANNELS) {
-    ADC->SWTRIG.bit.START = 0x1;
-  }
-  else {
-    adcIndex = 0;
-    disable_rtc_interrupts();
-  }
+void TC5_Handler() {
+  TC5->COUNT16.INTFLAG.bit.OVF = 0x1; // Clear the overflow flag
+  ADC->SWTRIG.bit.START = 0x1; // Start an ADC conversion
 }
 
 void ADC_Handler() {
   // With prescaler 32, freerun mode, 2 sample average, conversion takes ~54us
   uint16_t adcValue = ADC->RESULT.reg; // This will clear the INTFLAG.RESRDY interrupt flag
-  fetchReply.data[adcIndex++] = adcValue;
+  adcIndex++;
 }
 
 void SERCOM4_Handler()
@@ -273,10 +301,10 @@ Reference: Atmel-42181G-SAM-D21_Datasheet section 26.8.6 on page 503
     newMessage = true;
     SERCOM4->SPI.INTFLAG.bit.TXC = 1; // Clear Transmit Complete interrupt
 
-    // Start ADC sampling for the next fetch request
-    if (message.command == 2 && !rtc_interrupts_enabled()) {
-      start_rtc();
-    }
+    // // Start ADC sampling for the next fetch request
+    // if (message.command == 2 && !rtc_interrupts_enabled()) {
+    //   start_rtc();
+    // }
   }
   
   // Data Register Empty interrupt: Ready to transmit a single byte
@@ -319,20 +347,20 @@ void print_raw(void* obj, size_t size) {
   Serial.println();
 }
 
-void enable_rtc_interrupts() {
-  RTC->MODE0.INTENSET.bit.CMP0 = 0x1;
-}
+// void enable_rtc_interrupts() {
+//   RTC->MODE0.INTENSET.bit.CMP0 = 0x1;
+// }
 
-void disable_rtc_interrupts() {
-  RTC->MODE0.INTENCLR.bit.CMP0 = 0x1;
-}
+// void disable_rtc_interrupts() {
+//   RTC->MODE0.INTENCLR.bit.CMP0 = 0x1;
+// }
 
-bool rtc_interrupts_enabled() {
-  return RTC->MODE0.INTENSET.bit.CMP0;
-}
+// bool rtc_interrupts_enabled() {
+//   return RTC->MODE0.INTENSET.bit.CMP0;
+// }
 
-void start_rtc() {
-  RTC->MODE0.COUNT.reg = 0x0;
-  enable_rtc_interrupts();
-  while (RTC->MODE0.STATUS.bit.SYNCBUSY); // COUNT register needs sync
-}
+// void start_rtc() {
+//   RTC->MODE0.COUNT.reg = 0x0;
+//   enable_rtc_interrupts();
+//   while (RTC->MODE0.STATUS.bit.SYNCBUSY); // COUNT register needs sync
+// }
