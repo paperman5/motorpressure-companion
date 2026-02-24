@@ -35,7 +35,7 @@ void loop() {
 
 // Stores a 12bit uint (the 12 lower bits of a 16bit number) inside of a larger 8bit array as if
 // it were a native array of 12bit uints, such that each 12bit value is big-endian contiguous
-// on half-byte boundaries.
+// on half-byte boundaries. 8bit array should have size (12bit_size * 3 / 2).
 // Example: numbers `0x123` (little-endian `0x2301`) and `0x456` (LE `0x5604`)
 // at 12bit indices 0 and 1 become `0x12 34 56` in the underlying 8-bit array.
 inline void store_12bit(uint8_t arr8[], uint32_t index12, uint16_t value12) {
