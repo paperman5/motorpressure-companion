@@ -1,6 +1,8 @@
 // #define REGISTER_DEBUG
 // #define ADC_TEST_VALUES // Replaces ADC values with a monotonically increasing value for testing
+// #define TRANSMIT_TEST_VALUES // Replaces transmit buffer with testing values
 #define TEST_FLIGHT_TRIGGER
+// #define USB_CONNECTED
 
 #include <SPI.h>
 #include <FreeStack.h>
@@ -14,20 +16,23 @@
 #endif
 
 // WIRING (Adafruit Feather M0 Adalogger)
-// Flight Computer MOSI <-> Feather PA16 (Labelled 11)
-// Flight Computer SCK  <-> Feather PA17 (Labelled 13)
-// Flight Computer CS   <-> Feather PA18 (Labelled 10)
-// Flight Computer MISO <-> Feather PA19 (Labelled 12)
-// Pressure sensor output <-> Feather PA02 (Labelled A0) (3.3V MAX!)
+// Flight Computer MOSI <-> Feather PA16 (Labelled D11)
+// Flight Computer SCK  <-> Feather PA17 (Labelled D13)
+// Flight Computer CS   <-> Feather PA18 (Labelled D10)
+// Flight Computer MISO <-> Feather PA19 (Labelled D12)
+// Pressure sensor output <-> Feather PB08 (Labelled A1) (3.3V MAX!)
 
 #define CHANNELS 12
+#define PACKED_CHANNELS CHANNELS * 4 / 3
 #define BOARD_ID 0x7
 #define UPDATE_RATE 1 // Companion port update rate, 100Hz ticks
 #define ADC_RATE 10 // 1kHz increments, min 1, max 12 (1-12kHz)
+#define TRANSMIT_RATE_IDLE 1000   // Radio transmission rate while on the pad/after motor burn (1Hz)
+#define TRANSMIT_RATE_FLIGHT 100  // Radio transmission rate while motor is burning (10Hz)
 #define FIFO_SIZE 1024
 #define SD_MAX_CLOCK 24 // Mhz
 #define SD_MIN_CLOCK 8  // Mhz
-#define SD_FAT_TYPE 1 // 1 for FAT16/FAT32, 2 for exFAT, 3 for FAT16/FAT32 and exFAT.
+#define SD_FAT_TYPE 3 // 1 for FAT16/FAT32, 2 for exFAT, 3 for FAT16/FAT32 and exFAT.
 #define PIN_SD_CS 4
 #define PIN_SD_LED 8
 #define ERR_PATTERN_LENGTH 150 // millis between morse code beeps
@@ -59,7 +64,9 @@ enum FlightState { // From firmware kernel source `ao_flight.h`
   STARTUP = 0,
   IDLE = 1,
   PAD = 2,
+  // PAD->BOOST: Baro >20m vert OR accel >2g && vel > 5m/s
   BOOST = 3,
+  // BOOST->FAST: accel < -1/4g OR boost time > 15s
   FAST = 4,
   COAST = 5,
   DROGUE = 6,
@@ -117,6 +124,7 @@ AltOSSetupReply setupReply;
 AltOSFetchReply fetchReply;
 volatile ProgramState state = DISCONNECTED;
 ProgramState prevState = DISCONNECTED;
+FlightState prevFlightState = INVALID;
 sd_t sd;
 file_t dataFile;
 bool fileCreated = false;
@@ -129,13 +137,18 @@ volatile data_t currentData;
 // `volatile` after pointer type means pointer itself is volatile
 volatile data_t dataFifo0[FIFO_SIZE];
 volatile data_t dataFifo1[FIFO_SIZE];
-volatile uint16_t transmitBuffer[CHANNELS * 2];
+// Circular buffer to keep a history of decimated ADC values.
+volatile uint16_t transmitBuffer[PACKED_CHANNELS * 2];
+// Packed 12bit buffer storing the most recent decimated ADC values for transmission.
+// Copied to `fetchReply.data` as soon as a FETCH request is received.
+volatile uint8_t tempDataTransmit[CHANNELS * 2];
 volatile data_t* volatile currentDataBuffer = dataFifo0;
 volatile data_t* volatile dataBufferToWrite = dataFifo1;
 volatile bool doDataWrite = false;
 volatile bool sdCardIsWriting = false;
 volatile bool sdCardOverrun = false;
 volatile bool newMessage = false;
+volatile bool isFlightDecimation = false;
 #ifdef ADC_TEST_VALUES
 volatile uint16_t adcIndex = 0;
 #endif
@@ -151,7 +164,9 @@ void setup() {
   pinMode(PIN_SD_LED, OUTPUT);
   digitalWrite(PIN_SD_LED, LOW);
   Serial.begin(115200);
+#ifdef USB_CONNECTED
   while (!Serial);
+#endif
   Serial.println(F("Serial started"));
 
   setupReply.board_id = (uint16_t)BOARD_ID;
@@ -159,6 +174,7 @@ void setup() {
   setupReply.update_period = (uint8_t)UPDATE_RATE;
   setupReply.channels = (uint8_t)CHANNELS;
   message.command = 0;
+  message.flight_state = (uint8_t)INVALID;
   for (int i = 0; i < CHANNELS; i++) {
     fetchReply.data[i] = i;
   }
@@ -176,7 +192,8 @@ void setup() {
   init_adc();
   Serial.println(F("ADC Initialized"));
   init_adc_timer();
-  Serial.println(F("Timer Initialized"));
+  init_decimation_timer();
+  Serial.println(F("Timers Initialized"));
   sd_card_init();
   Serial.println(F("SD Card Initialized"));
   // TODO: Setup brownout detector?
@@ -192,25 +209,28 @@ void setup() {
 }
 
 void loop() {
-  ProgramState newState = state; // Store state in var so it stays constant through the loop
-                                 // If state is to be changed in loop(), change it using `state` not `newState`
   // if (newMessage) {
-  //   Serial.println(F("Received Message"));
-  //   print_raw(&message, sizeof(message));
-  //   Serial.printf("%d %d %d %d %d %d %d %d %d\n\n", message.command, message.flight_state, message.tick, 
+  //   // Serial.println(F("Received Message"));
+  //   // print_raw(&message, sizeof(message));
+  //   Serial.printf("%d %d %d %d %d %d %d %d %d\n", message.command, message.flight_state, message.tick, 
   //                                                   message.serial, message.flight, message.accel, message.speed, 
   //                                                   message.height, message.motor_number);
   //   newMessage = false;
   // }
+  FlightState newFlightState = static_cast<FlightState>(message.flight_state);
+  if (prevFlightState != newFlightState) {
+    handle_flight_state_change(prevFlightState, newFlightState);
+  }
+  ProgramState newState = state;
   if (prevState != newState) {
     handle_state_change(prevState, newState);
   }
 
 #ifdef TEST_FLIGHT_TRIGGER
-  //TESTING - Trigger flight after 5M loops in MONITORING
+  //TESTING - Trigger flight after 4M loops in MONITORING
   if (newState == MONITORING) {
     loopCount2++;
-    if (loopCount2 >= 5000000) {
+    if (loopCount2 >= 4000000 && loopCount2 < 4500000) {
       state = RECORDING;
     }
   }
@@ -223,7 +243,7 @@ void loop() {
     sd_write_buffer_to_file(&dataFile, dataBufferToWrite, sizeof(dataFifo0));
     sdCardIsWriting = false;
     writeCount++;
-    if (writeCount >= 150) {
+    if (writeCount >= 75) {
       state = DONE;
     }
   }
@@ -231,11 +251,8 @@ void loop() {
     sdCardOverrun = false;
     Serial.println(F("OVERRUN"));
   }
-  // if (loopCount >= 300000) {
-  //   loopCount = 0;
-  //   Serial.println(newState);
-  // }
   prevState = newState;
+  prevFlightState = newFlightState;
   loopCount++;
 }
 
@@ -250,7 +267,7 @@ void handle_state_change(ProgramState oldState, ProgramState newState) {
     Serial.println(F("Flight file created on SD card"));
   }
   else if (newState == RECORDING) {
-
+    set_flight_decimation();
   }
   else if (newState == DONE) {
     if (!finalize_file(&dataFile)) {
@@ -259,6 +276,29 @@ void handle_state_change(ProgramState oldState, ProgramState newState) {
     Serial.println(F("File Finalized, shutting down SD card"));
     sd.end();
     digitalWrite(PIN_SD_LED, HIGH);
+    set_idle_decimation();
+  }
+}
+
+void handle_flight_state_change(FlightState oldState, FlightState newState) {
+  Serial.printf("FLIGHT STATE: %d -> %d\n", oldState, newState);
+  if (newState == STARTUP) {
+    if (fileCreated) {
+      if (!finalize_file(&dataFile)) {
+        crash_with_error(SD_FILE_CLOSE_ERR);
+      }
+      fileCreated = false;
+    }
+    state = MONITORING;
+    set_idle_decimation();
+  }
+  else if (newState == BOOST) {
+    state = RECORDING;
+    set_flight_decimation();
+  }
+  else {
+    state = MONITORING;
+    set_idle_decimation();
   }
 }
 
@@ -290,17 +330,17 @@ void init_clocks() {
 }
 
 void init_adc() {
-  // Configure I/O port - PA02 is PINCFG[2], PMUX[1].PMUXE
-  PORT->Group[PORTA].DIRCLR.reg = PORT_PA02;
-  PORT->Group[PORTA].PINCFG[2].bit.INEN = 0x1;
-  PORT->Group[PORTA].PINCFG[2].bit.PMUXEN = 0x1; // Enable pin PA02
-  PORT->Group[PORTA].PMUX[1].bit.PMUXE = 0x1; // Select peripheral function B (ADC input)
+  // // Configure I/O port - PA02 is PINCFG[2], PMUX[1].PMUXE
+  // PORT->Group[PORTA].DIRCLR.reg = PORT_PA02;
+  // PORT->Group[PORTA].PINCFG[2].bit.INEN = 0x1;
+  // PORT->Group[PORTA].PINCFG[2].bit.PMUXEN = 0x1; // Enable pin PA02
+  // PORT->Group[PORTA].PMUX[1].bit.PMUXE = 0x1; // Select peripheral function B (ADC input)
 
-  // // Configure I/O port - PB08 is GroupB, PINCFG[8], PMUX[4].PMUXE
-  // PORT->Group[PORTB].DIRCLR.reg = PORT_PB08;
-  // PORT->Group[PORTB].PINCFG[8].bit.INEN = 0x1;
-  // PORT->Group[PORTB].PINCFG[8].bit.PMUXEN = 0x1; // Enable pin PA02
-  // PORT->Group[PORTB].PMUX[4].bit.PMUXE = 0x1; // Select peripheral function B (ADC input)
+  // Configure I/O port - PB08 is GroupB, PINCFG[8], PMUX[4].PMUXE
+  PORT->Group[PORTB].DIRCLR.reg = PORT_PB08;
+  PORT->Group[PORTB].PINCFG[8].bit.INEN = 0x1;
+  PORT->Group[PORTB].PINCFG[8].bit.PMUXEN = 0x1; // Enable pin PA02
+  PORT->Group[PORTB].PMUX[4].bit.PMUXE = 0x1; // Select peripheral function B (ADC input)
 
   // Reset ADC
   ADC->CTRLA.bit.ENABLE = 0x0;
@@ -326,8 +366,8 @@ void init_adc() {
   ADC->CALIB.reg = ADC_CALIB_BIAS_CAL(bias) | ADC_CALIB_LINEARITY_CAL(linearity);
   ADC->INPUTCTRL.bit.GAIN   = 0xF; // DIV2 gain due to voltage reference being 1/2 VCC
   ADC->INPUTCTRL.bit.MUXNEG = 0x18; // Internal ground as negative input
-  ADC->INPUTCTRL.bit.MUXPOS = 0x00; // PA02 (AIN0) as positive input
-  // ADC->INPUTCTRL.bit.MUXPOS = 0x02; // PB08 (AIN2) as positive input
+  // ADC->INPUTCTRL.bit.MUXPOS = 0x00; // PA02 (AIN0) as positive input
+  ADC->INPUTCTRL.bit.MUXPOS = 0x02; // PB08 (AIN2) as positive input
   ADC->INTENSET.bit.RESRDY  = 0x1; // Enable result ready interrupt
   ADC->REFCTRL.bit.REFCOMP  = 0x1; // Enable voltage reference compensation
   ADC->REFCTRL.bit.REFSEL   = 0x2; // 1.65V Reference (1/2 VCC)
@@ -340,8 +380,9 @@ void init_adc() {
   ADC->CTRLB.bit.FREERUN    = 0x0; // One-shot conversion mode (Triggered from timer)
   // ADC->CTRLB.bit.FREERUN    = 0x1; // Freerun conversion mode
   ADC->CTRLB.bit.DIFFMODE   = 0x0; // Single-ended conversion
-  // ADC->AVGCTRL.bit.SAMPLENUM = 0x1; // Average 2 samples
-  // ADC->AVGCTRL.bit.ADJRES   = 0x1; // Divisor of 2 (for 2 samples)
+  ADC->AVGCTRL.bit.SAMPLENUM = 0x2; // Average 4 samples
+  ADC->AVGCTRL.bit.ADJRES   = 0x2; // Divisor of 4 (for 4 samples)
+  // ADC->SAMPCTRL.bit.SAMPLEN = 0x4;
 
   // Re-enable ADC
   ADC->CTRLA.bit.ENABLE = 0x1;
@@ -376,6 +417,35 @@ void init_adc_timer() {
   while (TC5->COUNT16.STATUS.bit.SYNCBUSY);
 }
 
+void init_decimation_timer() {
+  // Clock source is GCLK2, setup with 16Mhz clock (see init_clocks)
+  GCLK->CLKCTRL.reg = GCLK_CLKCTRL_CLKEN | 
+                      GCLK_CLKCTRL_GEN_GCLK2 |
+                      GCLK_CLKCTRL_ID(GCM_TCC2_TC3);
+  while (GCLK->STATUS.bit.SYNCBUSY);
+  TC3->COUNT16.CTRLA.bit.ENABLE = 0x0;
+  while (TC3->COUNT16.STATUS.bit.SYNCBUSY);
+  TC3->COUNT16.CTRLA.bit.SWRST = 0x1;
+  while (TC3->COUNT16.STATUS.bit.SYNCBUSY);
+
+  NVIC_EnableIRQ(TC3_IRQn);
+  NVIC_SetPriority(TC3_IRQn, 2); // 2nd-lowest priority
+
+  TC3->COUNT16.CTRLA.bit.MODE = 0x0;        // 16-bit counter
+  TC3->COUNT16.CTRLA.bit.WAVEGEN = 0x1;     // Match frequency generation (CC0 becomes TOP value)
+  TC3->COUNT16.CTRLA.bit.PRESCSYNC = 0x0;   // Reset counter on next clock, not next prescaled clock
+  TC3->COUNT16.CTRLBSET.bit.ONESHOT = 0x0;  // Continue counting on wraparound
+  TC3->COUNT16.CTRLBSET.bit.DIR = 0x0;      // Count Up
+  TC3->COUNT16.CTRLA.bit.PRESCALER = 0x5;   // DIV64 prescaler for 250kHz clock
+  TC3->COUNT16.CC[0].reg = (uint16_t) (250 * TRANSMIT_RATE_IDLE / 16);
+  TC3->COUNT16.COUNT.reg = 0x0;
+
+  TC3->COUNT16.INTENSET.bit.OVF = 0x1;      // Enable overflow interrupt
+
+  TC3->COUNT16.CTRLA.bit.ENABLE = 0x1;
+  while (TC3->COUNT16.STATUS.bit.SYNCBUSY);
+}
+
 void sd_card_init() {
   uint8_t clock = SD_MAX_CLOCK;
   SdSpiConfig* config;
@@ -400,15 +470,25 @@ void sd_card_init() {
 
 /****** INTERRUPT HANDLERS ******/
 
+// ADC trigger timer
 void TC5_Handler() {
   TC5->COUNT16.INTFLAG.bit.OVF = 0x1; // Clear the overflow flag
   ADC->SWTRIG.bit.START = 0x1; // Start an ADC conversion
 }
 
+// Decimation timer
+void TC3_Handler() {
+  TC3->COUNT16.INTFLAG.bit.OVF = 0x1; // Clear the overflow flag
+  transmitBuffer[transmitIndex++] = currentData.value;
+  transmitIndex = transmitIndex % (sizeof(transmitBuffer) / sizeof(transmitBuffer[0]));
+  fill_temp_transmit_buffer();
+}
+
 void ADC_Handler() {
   uint16_t adcValue = ADC->RESULT.reg; // This will clear the INTFLAG.RESRDY interrupt flag
 #ifdef ADC_TEST_VALUES
-  adcValue = (adcIndex++ * 3) % 4096;
+  // adcValue = (adcIndex++ * 3) % 4096;
+  adcValue = adcIndex++ % 4096;
 #endif
   currentData.value = adcValue;
   currentDataBuffer[dataIndex].tick = currentData.tick;
@@ -454,6 +534,11 @@ void SERCOM1_Handler() {
       *((uint8_t *)&message + rxIndex) = data;
     }
     rxIndex++;
+    if (rxIndex == 1 && message.command == FETCH) {
+      for (int i = 0; i < sizeof(tempDataTransmit); i++) {
+        *((uint8_t *)(&fetchReply.data) + i) = tempDataTransmit[i];
+      }
+    }
   }
   
   // Data Transmit Complete interrupt: Overall data transmission is complete
@@ -552,6 +637,36 @@ inline uint16_t read_12bit(volatile uint8_t* arr8, uint32_t index12) {
   else {
     return (arr8[i8] << 8 | arr8[i8+1]) >> 4;
   }
+}
+
+void fill_temp_transmit_buffer() {
+  uint8_t startIndex = (transmitIndex - PACKED_CHANNELS + sizeof(transmitBuffer) / sizeof(transmitBuffer[0])) % (sizeof(transmitBuffer) / sizeof(transmitBuffer[0]));
+  for (int i = 0; i < PACKED_CHANNELS; i++) {
+#ifdef TRANSMIT_TEST_VALUES
+    store_12bit(tempDataTransmit, i, startIndex + i);
+#else
+    store_12bit(tempDataTransmit, i, transmitBuffer[startIndex++]);
+#endif
+    startIndex = startIndex % (sizeof(transmitBuffer) / sizeof(transmitBuffer[0]));
+  }
+}
+
+void set_idle_decimation() {
+  if (!isFlightDecimation) return;
+  TC3->COUNT16.CTRLA.bit.PRESCALER = 0x5;   // DIV64 prescaler for 250kHz clock
+  TC3->COUNT16.CC[0].reg = (uint16_t) (250 * TRANSMIT_RATE_IDLE / 16);
+  TC3->COUNT16.COUNT.reg = 0x0;
+  // while (TC3->COUNT16.STATUS.bit.SYNCBUSY);
+  isFlightDecimation = false;
+}
+
+void set_flight_decimation() {
+  if (isFlightDecimation) return;
+  TC3->COUNT16.CTRLA.bit.PRESCALER = 0x4;   // DIV16 prescaler for 1MHz clock
+  TC3->COUNT16.CC[0].reg = (uint16_t) (1000 * TRANSMIT_RATE_FLIGHT / 16);
+  TC3->COUNT16.COUNT.reg = 0x0;
+  // while (TC3->COUNT16.STATUS.bit.SYNCBUSY);
+  isFlightDecimation = true;
 }
 
 // Write a buffer to the SD card.
