@@ -202,6 +202,8 @@ void setup() {
   Serial.println(F("ADC Initialized"));
   init_adc_timer();
   init_decimation_timer();
+  // set_idle_decimation();
+  set_flight_decimation();
   Serial.println(F("Timers Initialized"));
   init_eic();
   Serial.println(F("EIC Initialized"));
@@ -289,6 +291,7 @@ void handle_state_change(ProgramState oldState, ProgramState newState) {
   }
   else if (newState == RECORDING) {
     set_flight_decimation();
+    // set_idle_decimation();
   }
   else if (newState == DONE) {
     if (!finalize_file(&dataFile)) {
@@ -298,7 +301,8 @@ void handle_state_change(ProgramState oldState, ProgramState newState) {
     sd.end();
     digitalWrite(PIN_SD_LED, HIGH);
     fileCreated = false;
-    set_idle_decimation();
+    set_flight_decimation();
+    // set_idle_decimation();
   }
 }
 
@@ -312,20 +316,23 @@ void handle_flight_state_change(FlightState oldState, FlightState newState) {
       fileCreated = false;
     }
     state = MONITORING;
-    set_idle_decimation();
+    set_flight_decimation();
+    // set_idle_decimation();
   }
   else if (newState == BOOST) {
     state = RECORDING;
     finalizeDelayTimer = 0;
     finalizeDelay = DISCONNECT_RECORD_TIME;
     set_flight_decimation();
+    // set_idle_decimation();
   }
   else if (oldState == BOOST && newState > BOOST) {
     // Serial.println("2");
     state = RECORDING;
     finalizeDelayTimer = 0;
     finalizeDelay = POST_BURNOUT_DELAY;
-    set_idle_decimation();
+    set_flight_decimation();
+    // set_idle_decimation();
   }
 }
 
@@ -575,7 +582,7 @@ void EIC_Handler() {
   // Serial.println(EIC->INTFLAG.reg);
   if (EIC->INTFLAG.bit.EXTINT2) {
     if (!companionInterruptToggleMode) {
-      // Serial.println(F("COMPANION INIT"));
+      Serial.println(F("COMPANION INIT"));
       companionConnected = true;
       companionInterruptToggleMode = true;
       EIC->CONFIG[0].bit.SENSE2 = 0x3; // Both-edge detection mode
@@ -583,11 +590,7 @@ void EIC_Handler() {
     }
     else {
       FlightState curFlightState = static_cast<FlightState>(message.flight_state);
-      if (companionConnected && curFlightState > PAD && curFlightState < INVALID && state != DONE) {
-        // Serial.println("3");
-        state = DONE;
-      }
-      else if (companionConnected && curFlightState <= PAD) {
+      if (companionConnected && curFlightState <= PAD) {
         // Flight computer is on the pad and has been reset, so reboot this too
         reboot();
       }
@@ -790,7 +793,9 @@ void set_idle_decimation() {
 void set_flight_decimation() {
   if (isFlightDecimation) return;
   TC3->COUNT16.CTRLA.bit.PRESCALER = 0x4;   // DIV16 prescaler for 1MHz clock
-  TC3->COUNT16.CC[0].reg = (uint16_t) (1000 * TRANSMIT_RATE_FLIGHT / 16);
+  // TC3->COUNT16.CC[0].reg = (uint16_t) (1000 * TRANSMIT_RATE_FLIGHT / 16);
+  // IDK WHY BUT THIS NEEDS TO BE 250X not 1000X FOR CORRECT DECIMATION
+  TC3->COUNT16.CC[0].reg = (uint16_t) (250 * TRANSMIT_RATE_FLIGHT / 16);
   TC3->COUNT16.COUNT.reg = 0x0;
   // while (TC3->COUNT16.STATUS.bit.SYNCBUSY);
   isFlightDecimation = true;
