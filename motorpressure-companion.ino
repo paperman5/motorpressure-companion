@@ -264,14 +264,9 @@ void loop() {
     //   state = DONE;
     // }
   }
-  else if (newState == DONE && finalizeDelayTimer >= (uint32_t)(finalizeDelay * ADC_RATE * 1000) && fileCreated) {
-    if (!finalize_file(&dataFile)) {
-      crash_with_error(SD_FILE_CLOSE_ERR);
-    }
-    Serial.println(F("File Finalized, shutting down SD card"));
-    sd.end();
-    digitalWrite(PIN_SD_LED, HIGH);
-    fileCreated = false;
+  else if (newState == RECORDING && finalizeDelayTimer >= (uint32_t)(finalizeDelay * ADC_RATE * 1000) && fileCreated) {
+    // Serial.println("1");
+    state = DONE;
   }
   if (sdCardOverrun) {
     sdCardOverrun = false;
@@ -296,6 +291,13 @@ void handle_state_change(ProgramState oldState, ProgramState newState) {
     set_flight_decimation();
   }
   else if (newState == DONE) {
+    if (!finalize_file(&dataFile)) {
+      crash_with_error(SD_FILE_CLOSE_ERR);
+    }
+    Serial.println(F("File Finalized, shutting down SD card"));
+    sd.end();
+    digitalWrite(PIN_SD_LED, HIGH);
+    fileCreated = false;
     set_idle_decimation();
   }
 }
@@ -314,14 +316,15 @@ void handle_flight_state_change(FlightState oldState, FlightState newState) {
   }
   else if (newState == BOOST) {
     state = RECORDING;
-    finalizeDelay = DISCONNECT_RECORD_TIME;
     finalizeDelayTimer = 0;
+    finalizeDelay = DISCONNECT_RECORD_TIME;
     set_flight_decimation();
   }
-  else if (newState > BOOST) {
-    state = DONE;
-    finalizeDelay = POST_BURNOUT_DELAY;
+  else if (oldState == BOOST && newState > BOOST) {
+    // Serial.println("2");
+    state = RECORDING;
     finalizeDelayTimer = 0;
+    finalizeDelay = POST_BURNOUT_DELAY;
     set_idle_decimation();
   }
 }
@@ -402,17 +405,17 @@ void init_adc() {
   ADC->INTENSET.bit.RESRDY  = 0x1; // Enable result ready interrupt
   ADC->REFCTRL.bit.REFCOMP  = 0x1; // Enable voltage reference compensation
   ADC->REFCTRL.bit.REFSEL   = 0x2; // 1.65V Reference (1/2 VCC)
-  ADC->CTRLB.bit.PRESCALER  = 0x4; // Prescaler 64
-                                   // NOTE: Max ADC clock is ~2.1MHz, use DIV64 to get 250kHz (48/3/64)
-                                   // ALSO NOTE: Max input impedance is ~60MOhm
+  ADC->CTRLB.bit.PRESCALER  = 0x2; // Prescaler 16
+                                   // NOTE: Max ADC clock is ~2.1MHz, use DIV16 to get 1MHz (48/3/64)
+                                   // ALSO NOTE: Max input impedance is ~12MOhm
                                    // https://blog.thea.codes/getting-the-most-out-of-the-samd21-adc/
   ADC->CTRLB.bit.RESSEL     = 0x0; // 12-bit resolution mode
   ADC->CTRLB.bit.CORREN     = 0x0; // Disable digital correction
   ADC->CTRLB.bit.FREERUN    = 0x0; // One-shot conversion mode (Triggered from timer)
   // ADC->CTRLB.bit.FREERUN    = 0x1; // Freerun conversion mode
   ADC->CTRLB.bit.DIFFMODE   = 0x0; // Single-ended conversion
-  ADC->AVGCTRL.bit.SAMPLENUM = 0x2; // Average 4 samples
-  ADC->AVGCTRL.bit.ADJRES   = 0x2; // Divisor of 4 (for 4 samples)
+  ADC->AVGCTRL.bit.SAMPLENUM = 0x3; // Average 8 samples
+  ADC->AVGCTRL.bit.ADJRES   = 0x3; // Divisor of 8 (for 8 samples)
   // ADC->SAMPCTRL.bit.SAMPLEN = 0x4;
 
   // Re-enable ADC
@@ -580,7 +583,8 @@ void EIC_Handler() {
     }
     else {
       FlightState curFlightState = static_cast<FlightState>(message.flight_state);
-      if (companionConnected && curFlightState > PAD && state != DONE) {
+      if (companionConnected && curFlightState > PAD && curFlightState < INVALID && state != DONE) {
+        // Serial.println("3");
         state = DONE;
       }
       else if (companionConnected && curFlightState <= PAD) {
