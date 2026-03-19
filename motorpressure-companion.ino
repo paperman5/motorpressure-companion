@@ -1,8 +1,8 @@
 // #define REGISTER_DEBUG
 // #define ADC_TEST_VALUES // Replaces ADC values with a monotonically increasing value for testing
 // #define TRANSMIT_TEST_VALUES // Replaces transmit buffer with testing values
-#define TEST_FLIGHT_TRIGGER
-// #define USB_CONNECTED
+// #define TEST_FLIGHT_TRIGGER
+#define USB_CONNECTED
 
 #include <SPI.h>
 #include <FreeStack.h>
@@ -38,6 +38,8 @@
 #define ERR_PATTERN_LENGTH 150 // millis between morse code beeps
 #define DATA_FILE_PREALLOCATE ADC_RATE * 1000 * 4 * 30  // 4 bytes @ ADC_RATE for 30s
 #define SD_WRITE_CHUNK_SIZE 512
+#define POST_BURNOUT_DELAY 1 // Additional time to log data after motor has burned out
+#define DISCONNECT_RECORD_TIME 15 // Total time to record in case flight computer is disconnected after boost
 
 #if SD_FAT_TYPE == 0
 typedef SdFat sd_t;
@@ -147,8 +149,15 @@ volatile data_t* volatile dataBufferToWrite = dataFifo1;
 volatile bool doDataWrite = false;
 volatile bool sdCardIsWriting = false;
 volatile bool sdCardOverrun = false;
+volatile bool sdCardConnected = false;
+volatile bool companionConnected = false;
+volatile bool sdInterruptToggleMode = false;
+volatile bool companionInterruptToggleMode = false;
 volatile bool newMessage = false;
 volatile bool isFlightDecimation = false;
+volatile uint32_t finalizeDelayTimer = 0;
+volatile uint32_t finalizeDelay = 0;
+volatile uint32_t adcTicks = 0;
 #ifdef ADC_TEST_VALUES
 volatile uint16_t adcIndex = 0;
 #endif
@@ -194,6 +203,14 @@ void setup() {
   init_adc_timer();
   init_decimation_timer();
   Serial.println(F("Timers Initialized"));
+  init_eic();
+  Serial.println(F("EIC Initialized"));
+  // if (!sdCardConnected) {
+  //   Serial.println(F("Waiting for SD card to be inserted"));
+  //   while(!sdCardConnected) {
+  //     delay(100);
+  //   }
+  // }
   sd_card_init();
   Serial.println(F("SD Card Initialized"));
   // TODO: Setup brownout detector?
@@ -242,10 +259,19 @@ void loop() {
     sdCardIsWriting = true;
     sd_write_buffer_to_file(&dataFile, dataBufferToWrite, sizeof(dataFifo0));
     sdCardIsWriting = false;
-    writeCount++;
-    if (writeCount >= 75) {
-      state = DONE;
+    // writeCount++;
+    // if (writeCount >= 75) {
+    //   state = DONE;
+    // }
+  }
+  else if (newState == DONE && finalizeDelayTimer >= (uint32_t)(finalizeDelay * ADC_RATE * 1000) && fileCreated) {
+    if (!finalize_file(&dataFile)) {
+      crash_with_error(SD_FILE_CLOSE_ERR);
     }
+    Serial.println(F("File Finalized, shutting down SD card"));
+    sd.end();
+    digitalWrite(PIN_SD_LED, HIGH);
+    fileCreated = false;
   }
   if (sdCardOverrun) {
     sdCardOverrun = false;
@@ -270,12 +296,6 @@ void handle_state_change(ProgramState oldState, ProgramState newState) {
     set_flight_decimation();
   }
   else if (newState == DONE) {
-    if (!finalize_file(&dataFile)) {
-      crash_with_error(SD_FILE_CLOSE_ERR);
-    }
-    Serial.println(F("File Finalized, shutting down SD card"));
-    sd.end();
-    digitalWrite(PIN_SD_LED, HIGH);
     set_idle_decimation();
   }
 }
@@ -294,10 +314,14 @@ void handle_flight_state_change(FlightState oldState, FlightState newState) {
   }
   else if (newState == BOOST) {
     state = RECORDING;
+    finalizeDelay = DISCONNECT_RECORD_TIME;
+    finalizeDelayTimer = 0;
     set_flight_decimation();
   }
-  else {
-    state = MONITORING;
+  else if (newState > BOOST) {
+    state = DONE;
+    finalizeDelay = POST_BURNOUT_DELAY;
+    finalizeDelayTimer = 0;
     set_idle_decimation();
   }
 }
@@ -327,6 +351,13 @@ void init_clocks() {
   while (GCLK->STATUS.reg & GCLK_STATUS_SYNCBUSY);
   GCLK->GENCTRL.reg = GCLK_GENCTRL_GENEN | GCLK_GENCTRL_SRC_DFLL48M | GCLK_GENCTRL_ID(3);
   while (GCLK->STATUS.reg & GCLK_STATUS_SYNCBUSY);
+
+  // Generic clock 4, used for External Interrupt Controller detection
+  // Setup with 48Mhz oscillator, divided by 2^23 for 5Hz
+  GCLK->GENDIV.reg = GCLK_GENDIV_ID(4) | GCLK_GENDIV_DIV(22);
+  while (GCLK->STATUS.reg & GCLK_STATUS_SYNCBUSY);
+  GCLK->GENCTRL.reg = GCLK_GENCTRL_GENEN | GCLK_GENCTRL_SRC_DFLL48M | GCLK_GENCTRL_ID(4) | GCLK_GENCTRL_DIVSEL;
+  while (GCLK->STATUS.reg & GCLK_STATUS_SYNCBUSY);
 }
 
 void init_adc() {
@@ -337,9 +368,9 @@ void init_adc() {
   // PORT->Group[PORTA].PMUX[1].bit.PMUXE = 0x1; // Select peripheral function B (ADC input)
 
   // Configure I/O port - PB08 is GroupB, PINCFG[8], PMUX[4].PMUXE
-  PORT->Group[PORTB].DIRCLR.reg = PORT_PB08;
+  PORT->Group[PORTB].DIRCLR.reg |= PORT_PB08;
   PORT->Group[PORTB].PINCFG[8].bit.INEN = 0x1;
-  PORT->Group[PORTB].PINCFG[8].bit.PMUXEN = 0x1; // Enable pin PA02
+  PORT->Group[PORTB].PINCFG[8].bit.PMUXEN = 0x1; // Enable pin PB08
   PORT->Group[PORTB].PMUX[4].bit.PMUXE = 0x1; // Select peripheral function B (ADC input)
 
   // Reset ADC
@@ -468,12 +499,65 @@ void sd_card_init() {
   sd.ls(LS_SIZE);
 }
 
+void init_eic() {
+  // Configure the external interrupt controller to detect disconnections from the companion port and the SD card.
+  NVIC_DisableIRQ(EIC_IRQn);
+  NVIC_ClearPendingIRQ(EIC_IRQn);
+  NVIC_SetPriority(EIC_IRQn, 0); // Highest priority
+  GCLK->CLKCTRL.reg = GCLK_CLKCTRL_CLKEN |
+                      GCLK_CLKCTRL_GEN_GCLK4 |
+                      GCLK_CLKCTRL_ID(EIC_GCLK_ID);
+  while (GCLK->STATUS.bit.SYNCBUSY);
+  EIC->CTRL.bit.ENABLE = 0x0;
+  while (EIC->STATUS.bit.SYNCBUSY);
+  EIC->CTRL.bit.SWRST = 0x1;
+  while (EIC->STATUS.bit.SYNCBUSY);
+
+  // 2 external interrupts, one on the companion port 3.3V line and one on the SD card card detect line.
+  // Companion port 3.3V is on A5 (PB02: EXTINT[2])
+  // SD Card Detect is on D7 (PA21: EXTINT[5]) (Datasheet pg. 21-23)
+
+  // Configure I/O ports - Input with pulldown
+  PORT->Group[PORTB].DIRCLR.reg |= PORT_PB02;
+  PORT->Group[PORTB].OUTCLR.reg |= PORT_PB02;
+  PORT->Group[PORTB].PINCFG[2].bit.INEN = 0x1;
+  PORT->Group[PORTB].PINCFG[2].bit.PULLEN = 0x1;
+  PORT->Group[PORTB].PINCFG[2].bit.PMUXEN = 0x1; // Enable pin PB02
+  PORT->Group[PORTB].PMUX[1].bit.PMUXE = MUX_PB02A_EIC_EXTINT2; // Select peripheral function A (EIC input)
+
+  // Input with pullup
+  PORT->Group[PORTA].DIRCLR.reg |= PORT_PA21;
+  PORT->Group[PORTA].OUTSET.reg |= PORT_PA21;
+  PORT->Group[PORTA].PINCFG[21].bit.INEN = 0x1;
+  PORT->Group[PORTA].PINCFG[21].bit.PULLEN = 0x1;
+  PORT->Group[PORTA].PINCFG[21].bit.PMUXEN = 0x1; // Enable pin PA21
+  PORT->Group[PORTA].PMUX[10].bit.PMUXO = MUX_PA21A_EIC_EXTINT5; // Select peripheral function A (EIC input)
+
+  // Config is set with index EXTINT[n*8+x] where n is config number and x is filter/sense index (pg. 353)
+  // These are initially configured for high-level detect to get a confirmed state before switching
+  //  to both-edge-detect mode, where each interrupt will toggle the connected state
+  EIC->CONFIG[0].bit.SENSE2 = 0x4; // High-level detect
+  EIC->CONFIG[0].bit.FILTEN2 = 0x1; // Filter enabled
+  EIC->CONFIG[0].bit.SENSE5 = 0x4; // High-level detect
+  EIC->CONFIG[0].bit.FILTEN5 = 0x1; // Filter enabled
+
+  EIC->INTENSET.bit.EXTINT2 = 0x1;
+  EIC->INTENSET.bit.EXTINT5 = 0x1;
+
+  EIC->CTRL.bit.ENABLE = 0x1;
+  while (EIC->STATUS.bit.SYNCBUSY);
+
+  NVIC_EnableIRQ(EIC_IRQn);
+}
+
 /****** INTERRUPT HANDLERS ******/
 
 // ADC trigger timer
 void TC5_Handler() {
   TC5->COUNT16.INTFLAG.bit.OVF = 0x1; // Clear the overflow flag
   ADC->SWTRIG.bit.START = 0x1; // Start an ADC conversion
+  finalizeDelayTimer++;
+  adcTicks++;
 }
 
 // Decimation timer
@@ -484,10 +568,40 @@ void TC3_Handler() {
   fill_temp_transmit_buffer();
 }
 
+void EIC_Handler() {
+  // Serial.println(EIC->INTFLAG.reg);
+  if (EIC->INTFLAG.bit.EXTINT2) {
+    if (!companionInterruptToggleMode) {
+      Serial.println(F("COMPANION INIT"));
+      companionConnected = true;
+      companionInterruptToggleMode = true;
+      EIC->CONFIG[0].bit.SENSE2 = 0x3; // Both-edge detection mode
+      while(EIC->STATUS.bit.SYNCBUSY);
+    }
+    else {
+      companionConnected = !companionConnected;
+      Serial.println(F("COMPANION TOGGLE"));
+    }
+  }
+  if (EIC->INTFLAG.bit.EXTINT5) {
+    if (!sdInterruptToggleMode) {
+      Serial.println(F("SD CARD INIT"));
+      sdCardConnected = true;
+      sdInterruptToggleMode = true;
+      EIC->CONFIG[0].bit.SENSE5 = 0x3; // Both-edge detection mode
+      while(EIC->STATUS.bit.SYNCBUSY);
+    }
+    else {
+      sdCardConnected = !sdCardConnected;
+      Serial.println(F("SD CARD TOGGLE"));
+    }
+  }
+  EIC->INTFLAG.reg = EIC->INTFLAG.reg;
+}
+
 void ADC_Handler() {
   uint16_t adcValue = ADC->RESULT.reg; // This will clear the INTFLAG.RESRDY interrupt flag
 #ifdef ADC_TEST_VALUES
-  // adcValue = (adcIndex++ * 3) % 4096;
   adcValue = adcIndex++ % 4096;
 #endif
   currentData.value = adcValue;
