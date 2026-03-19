@@ -36,10 +36,10 @@
 #define PIN_SD_CS 4
 #define PIN_SD_LED 8
 #define ERR_PATTERN_LENGTH 150 // millis between morse code beeps
-#define DATA_FILE_PREALLOCATE ADC_RATE * 1000 * 4 * 30  // 4 bytes @ ADC_RATE for 30s
+#define DATA_FILE_PREALLOCATE ADC_RATE * 1000 * 4 * 60  // 4 bytes @ ADC_RATE for 60s
 #define SD_WRITE_CHUNK_SIZE 512
 #define POST_BURNOUT_DELAY 1 // Additional time to log data after motor has burned out
-#define DISCONNECT_RECORD_TIME 15 // Total time to record in case flight computer is disconnected after boost
+#define DISCONNECT_RECORD_TIME 30 // Total time to record in case flight computer is disconnected after boost
 
 #if SD_FAT_TYPE == 0
 typedef SdFat sd_t;
@@ -171,6 +171,7 @@ uint32_t loopCount2 = 0;
 
 void setup() {
   pinMode(PIN_SD_LED, OUTPUT);
+  pinMode(PIN_A5, INPUT_PULLUP);
   digitalWrite(PIN_SD_LED, LOW);
   Serial.begin(115200);
 #ifdef USB_CONNECTED
@@ -203,8 +204,8 @@ void setup() {
   init_adc_timer();
   init_decimation_timer();
   Serial.println(F("Timers Initialized"));
-  init_eic();
-  Serial.println(F("EIC Initialized"));
+  // init_eic();
+  // Serial.println(F("EIC Initialized"));
   // if (!sdCardConnected) {
   //   Serial.println(F("Waiting for SD card to be inserted"));
   //   while(!sdCardConnected) {
@@ -264,7 +265,10 @@ void loop() {
     //   state = DONE;
     // }
   }
-  else if (newState == DONE && finalizeDelayTimer >= (uint32_t)(finalizeDelay * ADC_RATE * 1000) && fileCreated) {
+  else if (newState == RECORDING && finalizeDelayTimer >= (uint32_t)(finalizeDelay * ADC_RATE * 1000) && fileCreated) {
+    state = DONE;
+  }
+  else if (newState == DONE && fileCreated) {
     if (!finalize_file(&dataFile)) {
       crash_with_error(SD_FILE_CLOSE_ERR);
     }
@@ -277,6 +281,21 @@ void loop() {
     sdCardOverrun = false;
     Serial.println(F("OVERRUN"));
   }
+
+  if (newFlightState == INVALID) {
+    message.flight_state = STARTUP;
+  }
+  else if (newFlightState == STARTUP) {
+    message.flight_state = PAD;
+  }
+  if (newState == DISCONNECTED) {
+    state = MONITORING;
+  }
+  if (newState == MONITORING && !digitalRead(PIN_A5)) {
+    message.flight_state = BOOST;
+    state = RECORDING;
+  }
+
   prevState = newState;
   prevFlightState = newFlightState;
   loopCount++;
@@ -402,17 +421,17 @@ void init_adc() {
   ADC->INTENSET.bit.RESRDY  = 0x1; // Enable result ready interrupt
   ADC->REFCTRL.bit.REFCOMP  = 0x1; // Enable voltage reference compensation
   ADC->REFCTRL.bit.REFSEL   = 0x2; // 1.65V Reference (1/2 VCC)
-  ADC->CTRLB.bit.PRESCALER  = 0x4; // Prescaler 64
-                                   // NOTE: Max ADC clock is ~2.1MHz, use DIV64 to get 250kHz (48/3/64)
-                                   // ALSO NOTE: Max input impedance is ~60MOhm
+  ADC->CTRLB.bit.PRESCALER  = 0x2; // Prescaler 16
+                                   // NOTE: Max ADC clock is ~2.1MHz, use DIV16 to get 1MHz (48/3/64)
+                                   // ALSO NOTE: Max input impedance is ~12MOhm
                                    // https://blog.thea.codes/getting-the-most-out-of-the-samd21-adc/
   ADC->CTRLB.bit.RESSEL     = 0x0; // 12-bit resolution mode
   ADC->CTRLB.bit.CORREN     = 0x0; // Disable digital correction
   ADC->CTRLB.bit.FREERUN    = 0x0; // One-shot conversion mode (Triggered from timer)
   // ADC->CTRLB.bit.FREERUN    = 0x1; // Freerun conversion mode
   ADC->CTRLB.bit.DIFFMODE   = 0x0; // Single-ended conversion
-  ADC->AVGCTRL.bit.SAMPLENUM = 0x2; // Average 4 samples
-  ADC->AVGCTRL.bit.ADJRES   = 0x2; // Divisor of 4 (for 4 samples)
+  ADC->AVGCTRL.bit.SAMPLENUM = 0x3; // Average 8 samples
+  ADC->AVGCTRL.bit.ADJRES   = 0x3; // Divisor of 8 (for 8 samples)
   // ADC->SAMPCTRL.bit.SAMPLEN = 0x4;
 
   // Re-enable ADC
@@ -517,9 +536,9 @@ void init_eic() {
   // Companion port 3.3V is on A5 (PB02: EXTINT[2])
   // SD Card Detect is on D7 (PA21: EXTINT[5]) (Datasheet pg. 21-23)
 
-  // Configure I/O ports - Input with pulldown
+  // Configure I/O ports - Input with pullup
   PORT->Group[PORTB].DIRCLR.reg |= PORT_PB02;
-  PORT->Group[PORTB].OUTCLR.reg |= PORT_PB02;
+  PORT->Group[PORTB].OUTSET.reg |= PORT_PB02;
   PORT->Group[PORTB].PINCFG[2].bit.INEN = 0x1;
   PORT->Group[PORTB].PINCFG[2].bit.PULLEN = 0x1;
   PORT->Group[PORTB].PINCFG[2].bit.PMUXEN = 0x1; // Enable pin PB02
@@ -536,7 +555,7 @@ void init_eic() {
   // Config is set with index EXTINT[n*8+x] where n is config number and x is filter/sense index (pg. 353)
   // These are initially configured for high-level detect to get a confirmed state before switching
   //  to both-edge-detect mode, where each interrupt will toggle the connected state
-  EIC->CONFIG[0].bit.SENSE2 = 0x4; // High-level detect
+  EIC->CONFIG[0].bit.SENSE2 = 0x5; // Low-level detect
   EIC->CONFIG[0].bit.FILTEN2 = 0x1; // Filter enabled
   EIC->CONFIG[0].bit.SENSE5 = 0x4; // High-level detect
   EIC->CONFIG[0].bit.FILTEN5 = 0x1; // Filter enabled
@@ -557,6 +576,7 @@ void TC5_Handler() {
   TC5->COUNT16.INTFLAG.bit.OVF = 0x1; // Clear the overflow flag
   ADC->SWTRIG.bit.START = 0x1; // Start an ADC conversion
   finalizeDelayTimer++;
+  currentData.tick++;
   adcTicks++;
 }
 
@@ -573,7 +593,11 @@ void EIC_Handler() {
   if (EIC->INTFLAG.bit.EXTINT2) {
     if (!companionInterruptToggleMode) {
       // Serial.println(F("COMPANION INIT"));
+      message.flight_state = BOOST;
+      state = RECORDING;
       companionConnected = true;
+      finalizeDelay = DISCONNECT_RECORD_TIME;
+      finalizeDelayTimer = 0;
       companionInterruptToggleMode = true;
       EIC->CONFIG[0].bit.SENSE2 = 0x3; // Both-edge detection mode
       while(EIC->STATUS.bit.SYNCBUSY);
