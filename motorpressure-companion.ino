@@ -572,20 +572,29 @@ void EIC_Handler() {
   // Serial.println(EIC->INTFLAG.reg);
   if (EIC->INTFLAG.bit.EXTINT2) {
     if (!companionInterruptToggleMode) {
-      Serial.println(F("COMPANION INIT"));
+      // Serial.println(F("COMPANION INIT"));
       companionConnected = true;
       companionInterruptToggleMode = true;
       EIC->CONFIG[0].bit.SENSE2 = 0x3; // Both-edge detection mode
       while(EIC->STATUS.bit.SYNCBUSY);
     }
     else {
+      FlightState curFlightState = static_cast<FlightState>(message.flight_state);
+      if (companionConnected && curFlightState > PAD && state != DONE) {
+        state = DONE;
+      }
+      else if (companionConnected && curFlightState <= PAD) {
+        // Flight computer is on the pad and has been reset, so reboot this too
+        reboot();
+      }
       companionConnected = !companionConnected;
-      Serial.println(F("COMPANION TOGGLE"));
+      // Serial.print(F("COMPANION TOGGLE"));
+      // Serial.println(companionConnected);
     }
   }
   if (EIC->INTFLAG.bit.EXTINT5) {
     if (!sdInterruptToggleMode) {
-      Serial.println(F("SD CARD INIT"));
+      // Serial.println(F("SD CARD INIT"));
       sdCardConnected = true;
       sdInterruptToggleMode = true;
       EIC->CONFIG[0].bit.SENSE5 = 0x3; // Both-edge detection mode
@@ -593,7 +602,7 @@ void EIC_Handler() {
     }
     else {
       sdCardConnected = !sdCardConnected;
-      Serial.println(F("SD CARD TOGGLE"));
+      // Serial.println(F("SD CARD TOGGLE"));
     }
   }
   EIC->INTFLAG.reg = EIC->INTFLAG.reg;
@@ -665,7 +674,7 @@ void SERCOM1_Handler() {
     newMessage = true;
     SERCOM1->SPI.INTFLAG.bit.TXC = 1; // Clear Transmit Complete interrupt
 
-    if (message.command == SETUP && state == DISCONNECTED) {
+    if (message.command <= NOTIFY && message.command > 0 && state == DISCONNECTED) {
       state = MONITORING;
     }
 
@@ -820,6 +829,13 @@ inline bool remove_file(file_t* fileObj) {
 
 inline bool finalize_file(file_t* fileObj) {
   return fileObj->truncate() && fileObj->close();
+}
+
+inline bool reboot() {
+  Serial.println(F("RESET"));
+  __disable_irq();
+  NVIC_SystemReset();
+  while(true);
 }
 
 /****** ERRORS ******/
