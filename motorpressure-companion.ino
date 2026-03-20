@@ -2,7 +2,7 @@
 // #define ADC_TEST_VALUES // Replaces ADC values with a monotonically increasing value for testing
 // #define TRANSMIT_TEST_VALUES // Replaces transmit buffer with testing values
 // #define TEST_FLIGHT_TRIGGER
-#define USB_CONNECTED
+// #define USB_CONNECTED
 
 #include <SPI.h>
 #include <FreeStack.h>
@@ -273,6 +273,9 @@ void loop() {
   if (sdCardOverrun) {
     sdCardOverrun = false;
     Serial.println(F("OVERRUN"));
+  }
+  if (newState == MONITORING && newFlightState == PAD && fileCreated) {
+    digitalWrite(PIN_SD_LED, HIGH);
   }
   prevState = newState;
   prevFlightState = newFlightState;
@@ -841,6 +844,7 @@ inline bool finalize_file(file_t* fileObj) {
 }
 
 inline bool reboot() {
+  digitalWrite(PIN_SD_LED, LOW);
   Serial.println(F("RESET"));
   __disable_irq();
   NVIC_SystemReset();
