@@ -251,6 +251,8 @@ void loop() {
     loopCount2++;
     if (loopCount2 >= 4000000 && loopCount2 < 4500000) {
       state = RECORDING;
+      finalizeDelayTimer = 0;
+      finalizeDelay = DISCONNECT_RECORD_TIME;
     }
   }
 #endif
