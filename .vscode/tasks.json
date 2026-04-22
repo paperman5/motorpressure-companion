@@ -24,6 +24,8 @@
             "args": [
                 "load",
                 "${command:raspberry-pi-pico.launchTargetPath}",
+                "--ser",
+                "DF6510674F9D4032",
                 "-fx"
             ],
             "presentation": {

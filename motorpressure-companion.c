@@ -1,93 +1,212 @@
 #include <stdio.h>
+#include <string.h>
 #include "pico/stdlib.h"
 #include "companion_types.h"
 #include "hardware/spi.h"
 #include "hardware/irq.h"
+#include "hardware/dma.h"
+#include "hardware/pio.h"
 #include "hardware/structs/spi.h"
 #include "pico/binary_info.h"
 #include "motorpressure_companion.h"
+#include "pio_spi.pio.h"
 #include "pico/time.h"
-
-enum Command {
-    CMD_SETUP = 1,
-    CMD_FETCH = 2,
-    CMD_NOTIFY = 3
-};
-enum FlightState { // From firmware kernel source `ao_flight.h`
-    FS_STARTUP = 0,
-    FS_IDLE = 1,
-    FS_PAD = 2,
-    // PAD->BOOST: Baro >20m vert OR accel >2g && vel > 5m/s
-    FS_BOOST = 3,
-    // BOOST->FAST: accel < -1/4g OR boost time > 15s
-    FS_FAST = 4,
-    FS_COAST = 5,
-    FS_DROGUE = 6,
-    FS_MAIN = 7,
-    FS_LANDED = 8,
-    FS_INVALID = 9,
-    FS_TEST = 10
-};
-enum ProgramState {
-    PS_DISCONNECTED = 0,
-    PS_MONITORING = 1,
-    PS_RECORDING = 2,
-    PS_DONE = 3,
-    PS_ERROR = -1
-};
+#include "pio_spi.pio.h"
 
 
+altos_header_t message;
+altos_setup_t setup_reply;
+altos_fetch_t fetch_reply;
+
+uint pio_offset_cs = 0;
+uint pio_offset_data = 0;
 
 int main()
 {
     stdio_init_all();
-    sleep_ms(10000);
+    sleep_ms(1000);
     setup_spi();
+    puts("SPI SETUP COMPLETE");
+    setup_messages();
+    puts("MESSAGE SETUP COMPLETE");
+
+    pio_spi_start();
+    puts("SPI STARTED");
 
     while (true) {
-        // printf("Hello, world!\n");
-        // sleep_ms(1000);
+        tight_loop_contents();
     }
 }
 
+static void setup_pio_spi_sm(PIO pio, uint cs_sm, uint data_sm, int cs_pin, int sck_pin, int miso_pin, int mosi_pin, irq_handler_t pio_irq_handler) {
+    pio_sm_claim(pio, cs_sm);
+    pio_sm_claim(pio, data_sm);
+    pio_offset_cs = pio_add_program(pio, &spi_cs_program);
+    pio_offset_data = pio_add_program(pio, &spi_data_program);
+    
+    pio_sm_config conf_cs = spi_cs_program_get_default_config(pio_offset_cs);
+    pio_sm_config conf_data = spi_data_program_get_default_config(pio_offset_data);
+
+    sm_config_set_in_pins(&conf_cs, cs_pin);
+    
+    // SCK pin must be directly after MOSI pin, because all input pins must be
+    // consecutive and data is read starting from the first pin.
+    sm_config_set_in_pins(&conf_data, mosi_pin);
+    sm_config_set_out_pins(&conf_data, miso_pin, 1);
+
+    sm_config_set_in_shift(&conf_data, false, false, 8);
+    sm_config_set_out_shift(&conf_data, false, false, 8);
+    sm_config_set_out_special(&conf_data, true, false, 0);
+
+    pio_sm_set_pindirs_with_mask(pio, cs_sm, 0<<cs_pin, 1<<cs_pin);
+    pio_sm_set_pindirs_with_mask(pio, data_sm, (0<<sck_pin)|(0<<mosi_pin)|(1<<miso_pin), 
+                                               (1<<sck_pin)|(1<<mosi_pin)|(1<<miso_pin));
+
+    pio_gpio_init(pio, cs_pin);
+    pio_gpio_init(pio, sck_pin);
+    pio_gpio_init(pio, miso_pin);
+    pio_gpio_init(pio, mosi_pin);
+    // Give CS & SCK a pullup so they don't cause spurious events while the flight computer is booting.
+    gpio_set_pulls(cs_pin, true, false);
+    gpio_set_pulls(sck_pin, true, false);
+    gpio_set_pulls(miso_pin, false, true);
+    gpio_set_pulls(mosi_pin, false, false);
+    pio_set_irq0_source_mask_enabled(pio, (1<<pis_interrupt0) | (1<<pis_interrupt1), true);
+    irq_set_exclusive_handler(pio_get_irq_num(pio, 0), pio_irq_handler);
+    irq_set_enabled(pio_get_irq_num(pio, 0), true);
+
+    pio_sm_init(pio, cs_sm, pio_offset_cs, &conf_cs);
+    pio_sm_init(pio, data_sm, pio_offset_data, &conf_data);
+}
+
+static inline void reset_data_sm() {
+    pio_sm_exec_wait_blocking(PIO_SPI_COMPANION, PIO_SPI_DATA_SM, pio_encode_jmp(pio_offset_data + spi_data_offset_reset));
+    // While transmitting a message to the flight computer, the PIO state machine will continue to fill the RX FIFO.
+    // When the next message is received this RX FIFO with irrelevant data will be transferred into memory via DMA.
+    // Therefore we want to clear the FIFOs before that happens.
+    pio_sm_clear_fifos(PIO_SPI_COMPANION, PIO_SPI_DATA_SM);
+}
+
+static void setup_pio_spi_dma(PIO pio, uint cs_sm, uint data_sm, uint rx_cmd_chan, uint rx_msg_chan, uint tx_chan, altos_header_t *msg, irq_handler_t dma_irq_handler) {
+    // 3 DMA channels:
+    // 1-Receives first header byte (command), chains immediately to #2 & configures #3
+    // 2-Receives the remaining 15 bytes of the header & chains to #3
+    // 3-Transmits to the flight computer with the correct message (or nothing if not needed)
+    dma_claim_mask((1<<rx_cmd_chan) | (1<<rx_msg_chan) | (1<<tx_chan));
+    
+    dma_channel_config_t config = dma_channel_get_default_config(rx_cmd_chan);
+    channel_config_set_transfer_data_size(&config, DMA_SIZE_8);
+    channel_config_set_dreq(&config, pio_get_dreq(pio, data_sm, false));
+    channel_config_set_read_increment(&config, false);
+    channel_config_set_write_increment(&config, false);
+    channel_config_set_chain_to(&config, rx_msg_chan);
+    dma_channel_configure(rx_cmd_chan, &config, (uint8_t *)msg, 
+                          &pio->rxf[data_sm], dma_encode_transfer_count(1), false);
+
+    config = dma_channel_get_default_config(rx_msg_chan);
+    channel_config_set_transfer_data_size(&config, DMA_SIZE_8);
+    channel_config_set_dreq(&config, pio_get_dreq(pio, data_sm, false));
+    channel_config_set_read_increment(&config, false);
+    channel_config_set_write_increment(&config, true);
+    channel_config_set_chain_to(&config, tx_chan);
+    dma_channel_configure(rx_msg_chan, &config, ((uint8_t *)msg) + 1, 
+                          &pio->rxf[data_sm], dma_encode_transfer_count(sizeof(message)-1), false);
+
+    config = dma_channel_get_default_config(tx_chan);
+    channel_config_set_transfer_data_size(&config, DMA_SIZE_8);
+    channel_config_set_dreq(&config, pio_get_dreq(pio, data_sm, true));
+    channel_config_set_read_increment(&config, true);
+    channel_config_set_write_increment(&config, false);
+    dma_channel_configure(tx_chan, &config, &pio->txf[data_sm], NULL, 0, false);
+
+    dma_set_irq0_channel_mask_enabled((1<<rx_cmd_chan), true);
+    irq_set_exclusive_handler(DMA_IRQ_0, dma_irq_handler);
+    irq_set_enabled(DMA_IRQ_0, true);
+}
+
+static void setup_messages() {
+    memset(&message, 0, sizeof(message));
+    memset(&setup_reply, 0, sizeof(setup_reply));
+    memset(&fetch_reply, 0, sizeof(fetch_reply));
+
+    setup_reply.board_id = (uint16_t)7;
+    setup_reply.board_id_inverse = (uint16_t)~(setup_reply.board_id);
+    setup_reply.channels = count_of(fetch_reply.data);
+    setup_reply.update_period = 1;
+
+    for (int i = 0; i < count_of(fetch_reply.data); i++) {
+        fetch_reply.data[i] = i;
+    }
+}
+
+static void pio_spi_start() {
+    pio_set_sm_mask_enabled(PIO_SPI_COMPANION, (1<<PIO_SPI_CS_SM)|(1<<PIO_SPI_DATA_SM), true);
+}
+
+static void pio_spi_stop() {
+
+}
 
 
 void setup_spi() {
-    spi_init(SPI_COMPANION, SPI_BAUDRATE);
-    spi_set_format(SPI_COMPANION, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
-    spi_set_slave(SPI_COMPANION, true);
-    gpio_set_function(PIN_SPI_SCK, GPIO_FUNC_SPI);
-    gpio_set_function(PIN_SPI_MOSI, GPIO_FUNC_SPI);
-    gpio_set_function(PIN_SPI_MISO, GPIO_FUNC_SPI);
-    gpio_set_function(PIN_SPI_CS, GPIO_FUNC_SPI);
-    gpio_set_pulls(PIN_SPI_SCK, false, false);
-    gpio_set_pulls(PIN_SPI_MOSI, false, false);
-    gpio_set_pulls(PIN_SPI_MISO, false, false);
-    gpio_set_pulls(PIN_SPI_CS, false, false);
-    gpio_set_slew_rate(PIN_SPI_SCK, GPIO_SLEW_RATE_FAST);
-    gpio_set_slew_rate(PIN_SPI_MOSI, GPIO_SLEW_RATE_FAST);
-    gpio_set_slew_rate(PIN_SPI_MISO, GPIO_SLEW_RATE_FAST);
-    gpio_set_slew_rate(PIN_SPI_CS, GPIO_SLEW_RATE_FAST);
-    gpio_set_drive_strength(PIN_SPI_SCK, GPIO_DRIVE_STRENGTH_2MA);
-    gpio_set_drive_strength(PIN_SPI_MOSI, GPIO_DRIVE_STRENGTH_2MA);
-    gpio_set_drive_strength(PIN_SPI_MISO, GPIO_DRIVE_STRENGTH_4MA);
-    gpio_set_drive_strength(PIN_SPI_CS, GPIO_DRIVE_STRENGTH_2MA);
-    const uint spi_irq = SPI_NUM(SPI_COMPANION) ? SPI1_IRQ : SPI0_IRQ;
-    // irq_set_exclusive_handler(spi_irq, companion_handler);
-    // spi_get_hw(SPI_COMPANION)->imsc = 1 << 3 | 1 << 2; // TX & RX interrupts enabled
-    // irq_set_enabled(spi_irq, true);
+    setup_pio_spi_sm(PIO_SPI_COMPANION, PIO_SPI_CS_SM, PIO_SPI_DATA_SM, PIN_SPI_CS, PIN_SPI_SCK, PIN_SPI_MISO, PIN_SPI_MOSI, spi_handler);
+    setup_pio_spi_dma(PIO_SPI_COMPANION, PIO_SPI_CS_SM, PIO_SPI_DATA_SM, DMA_RX_CMD_CHAN, DMA_RX_MSG_CHAN, DMA_TX_CHAN, &message, dma_handler);
+    
     bi_decl(bi_4pins_with_func(PIN_SPI_MOSI, PIN_SPI_MISO, PIN_SPI_SCK, PIN_SPI_CS, GPIO_FUNC_SPI));
-
-    printf("%d\n", gpio_get_drive_strength(PIN_SPI_SCK));
-    printf("%d\n", gpio_get_drive_strength(PIN_SPI_MOSI));
-    printf("%d\n", gpio_get_drive_strength(PIN_SPI_MISO));
-    printf("%d\n", gpio_get_drive_strength(PIN_SPI_CS));
-    printf("%d\n", gpio_get_slew_rate(PIN_SPI_SCK));
-    printf("%d\n", gpio_get_slew_rate(PIN_SPI_MOSI));
-    printf("%d\n", gpio_get_slew_rate(PIN_SPI_MISO));
-    printf("%d\n", gpio_get_slew_rate(PIN_SPI_CS));
 }
 
-void companion_handler() {
-    // printf("%d\n", spi_get_hw(SPI_COMPANION)->dr);
+void spi_handler() {
+    if (pio_interrupt_get(PIO_SPI_COMPANION, 0)) {
+        // CS LOW
+        // puts("CS LOW");
+        pio_interrupt_clear(PIO_SPI_COMPANION, 0);
+        dma_channel_set_write_addr(DMA_RX_MSG_CHAN, ((uint8_t *)&message) + 1, false);
+        dma_channel_set_write_addr(DMA_RX_CMD_CHAN, (uint8_t *)&message, true);
+    }
+    if (pio_interrupt_get(PIO_SPI_COMPANION, 1)) {
+        // CS HIGH
+        pio_interrupt_clear(PIO_SPI_COMPANION, 1);
+        reset_data_sm();
+        // print_raw(&message, sizeof(message));
+    }
+}
+
+void dma_handler() {
+    if (dma_channel_get_irq0_status(DMA_RX_CMD_CHAN)) {
+        dma_channel_acknowledge_irq0(DMA_RX_CMD_CHAN);
+        // If there is an in-progress TX operation, abort it
+        if (dma_channel_is_busy(DMA_TX_CHAN)) {
+            dma_hw->abort = 1<<DMA_TX_CHAN;
+        }
+        // Adjust the address/transfers for the TX operation based on the command received
+        switch (message.command) {
+            case CMD_SETUP:
+                dma_channel_set_read_addr(DMA_TX_CHAN, &setup_reply, false);
+                dma_channel_set_transfer_count(DMA_TX_CHAN, dma_encode_transfer_count(sizeof(setup_reply)), false);
+                break;
+            case CMD_FETCH:
+                dma_channel_set_read_addr(DMA_TX_CHAN, &(fetch_reply.data), false);
+                dma_channel_set_transfer_count(DMA_TX_CHAN, dma_encode_transfer_count(sizeof(fetch_reply.data)), false);
+                break;
+            default:
+                dma_channel_set_read_addr(DMA_TX_CHAN, NULL, false);
+                dma_channel_set_transfer_count(DMA_TX_CHAN, 0, false);
+                break;
+        }
+    }
+}
+
+inline void print_raw(void* obj, size_t size) {
+    uint8_t* buf = (uint8_t *)(obj);
+    for (uint16_t i = 0; i < size; i++) {
+        printf("%02X%s", *(buf + i), (i + 1) % 8 == 0 ? "\n" : " ");
+    }
+    printf("\n");
+}
+
+inline void print_binary(int num) {
+    for (int i = sizeof(int) * 8 - 1; i >= 0; i--) {
+        printf("%d", (num>>i)&1);
+    }
+    printf("\n");
 }

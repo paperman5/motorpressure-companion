@@ -37,6 +37,8 @@ pico_sdk_init()
 
 add_executable(motorpressure-companion motorpressure-companion.c )
 
+pico_generate_pio_header(motorpressure-companion ${CMAKE_CURRENT_LIST_DIR}/pio_spi.pio)
+
 pico_set_program_name(motorpressure-companion "motorpressure-companion")
 pico_set_program_version(motorpressure-companion "0.1")
 
@@ -52,7 +54,9 @@ pico_enable_stdio_usb(motorpressure-companion 1)
 # Add the standard library to the build
 target_link_libraries(motorpressure-companion
         pico_stdlib
-        hardware_spi)
+        hardware_spi
+        hardware_pio
+        hardware_dma)
 
 # Add the standard include files to the build
 target_include_directories(motorpressure-companion PRIVATE
@@ -61,4 +65,5 @@ target_include_directories(motorpressure-companion PRIVATE
 
 pico_add_extra_outputs(motorpressure-companion)
 
-set(SYS_CLK_HZ 48000000)
+# Adjust the system clock speed
+# set(SYS_CLK_HZ 48000000)

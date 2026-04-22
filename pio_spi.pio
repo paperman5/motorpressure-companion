@@ -1,0 +1,29 @@
+; SPI data loop, configure with autopull/push threshold at 8
+; Autopull is not actually used but `pull ifempty` is used.
+; PIO should be set up with DMAs for data notifications.
+; The companion port SPI uses CPHA=0, CPOL=0. However it also uses
+; a pullup on CS and SCK and pulldown on MOSI.
+.program spi_data
+public reset:
+	mov isr, null
+	mov osr, null
+	wait 1 irq 7
+.wrap_target
+	wait 0 pin 1           ; Wait for clock to go low
+	pull ifempty noblock   ; Pull from TX FIFO if there is data, otherwise load Scratch X
+	out pins 1             ; Write output bit to MISO
+	wait 1 pin 1           ; Wait for clock to go high
+	in pins 1              ; Read MOSI
+	push iffull noblock    ; Push to the RX FIFO if we have 8 bits
+.wrap                      ; if RX FIFO is full, discard the data
+
+
+; SPI CS loop, only here to raise IRQs for CPU control of the data loop
+.program spi_cs
+.wrap_target
+	wait 0 pin 0           ; Wait for CS to go low
+	irq set 0              ; Raise CS LOW IRQ
+	irq set 7              ; Raise IRQ 7 to start data loop
+	wait 1 pin 0           ; Wait for CS to go high
+	irq set 1              ; Raise CS HIGH IRQ
+.wrap
