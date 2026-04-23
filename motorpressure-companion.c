@@ -12,6 +12,7 @@
 #include "pio_spi.pio.h"
 #include "pico/time.h"
 #include "pio_spi.pio.h"
+#include "hardware/adc.h"
 
 
 altos_header_t message;
@@ -20,6 +21,9 @@ altos_fetch_t fetch_reply;
 
 uint pio_offset_cs = 0;
 uint pio_offset_data = 0;
+
+uint16_t adc_buf[128];
+volatile uint16_t adc_idx = 0;
 
 int main()
 {
@@ -32,6 +36,9 @@ int main()
 
     pio_spi_start();
     puts("SPI STARTED");
+
+    setup_adc();
+    puts("ADC STARTED");
 
     while (true) {
         tight_loop_contents();
@@ -132,7 +139,7 @@ static void setup_messages() {
     setup_reply.board_id = (uint16_t)7;
     setup_reply.board_id_inverse = (uint16_t)~(setup_reply.board_id);
     setup_reply.channels = count_of(fetch_reply.data);
-    setup_reply.update_period = 1;
+    setup_reply.update_period = COMPANION_FETCH_RATE;
 
     for (int i = 0; i < count_of(fetch_reply.data); i++) {
         fetch_reply.data[i] = i;
@@ -147,12 +154,54 @@ static void pio_spi_stop() {
 
 }
 
-
 void setup_spi() {
     setup_pio_spi_sm(PIO_SPI_COMPANION, PIO_SPI_CS_SM, PIO_SPI_DATA_SM, PIN_SPI_CS, PIN_SPI_SCK, PIN_SPI_MISO, PIN_SPI_MOSI, spi_handler);
-    setup_pio_spi_dma(PIO_SPI_COMPANION, PIO_SPI_CS_SM, PIO_SPI_DATA_SM, DMA_RX_CMD_CHAN, DMA_RX_MSG_CHAN, DMA_TX_CHAN, &message, dma_handler);
+    setup_pio_spi_dma(PIO_SPI_COMPANION, PIO_SPI_CS_SM, PIO_SPI_DATA_SM, DMA_RX_CMD_CHAN, DMA_RX_MSG_CHAN, DMA_TX_CHAN, &message, dma_spi_handler);
     
     bi_decl(bi_4pins_with_func(PIN_SPI_MOSI, PIN_SPI_MISO, PIN_SPI_SCK, PIN_SPI_CS, GPIO_FUNC_SPI));
+}
+
+void setup_adc() {
+    memset(adc_buf, 0, sizeof(adc_buf));
+    adc_gpio_init(ADC_BASE_PIN + ADC_CHAN);
+    adc_init();
+    adc_select_input(ADC_CHAN);
+    adc_set_clkdiv(0.0f);
+    adc_fifo_setup(true,    // Enable FIFO
+                   true,    // Enable DRAM DREQ
+                   1,       // DREQ size of 1 (Datasheet 4.9.2.5 pg. 561)
+                   false,   // No error flag
+                   false);  // No 12b->8b byte shift
+
+    setup_adc_dma();
+    dma_channel_start(DMA_ADC_CHAN);
+    
+    // Let the ADC run!
+    adc_run(true);
+}
+
+void setup_adc_dma() {
+    // DMA to read the samples coming in from the ADC. Max ADC rate is 500ksps,
+    // and since we are aiming for 1ksps we can oversample 500 times. (+ ~4.5 ENOB)
+    // To achieve this we can (ab)use the DMA sniffer accumulation register usually
+    // used for CRC checks to add up the 500 samples, then retrieve the accumulated
+    // value from this register. Individual samples are DMA'd to NULL.
+    dma_channel_claim(DMA_ADC_CHAN);
+    dma_channel_config_t config = dma_channel_get_default_config(DMA_ADC_CHAN);
+    channel_config_set_transfer_data_size(&config, DMA_SIZE_16);
+    channel_config_set_dreq(&config, DREQ_ADC);
+    channel_config_set_read_increment(&config, false);
+    channel_config_set_write_increment(&config, false);
+    channel_config_set_sniff_enable(&config, true);
+    dma_sniffer_set_data_accumulator(0);
+    // Set the sniffer to add each DMA'd value to the accumulation register
+    dma_sniffer_enable(DMA_ADC_CHAN, DMA_SNIFF_CTRL_CALC_VALUE_SUM, true);
+    dma_channel_configure(DMA_ADC_CHAN, &config, NULL, &adc_hw->fifo, 
+                          dma_encode_transfer_count(ADC_OVERSAMPLE_COUNT), false);
+    
+    dma_set_irq1_channel_mask_enabled((1<<DMA_ADC_CHAN), true);
+    irq_set_exclusive_handler(DMA_IRQ_1, dma_adc_handler);
+    irq_set_enabled(DMA_IRQ_1, true);
 }
 
 void spi_handler() {
@@ -171,7 +220,7 @@ void spi_handler() {
     }
 }
 
-void dma_handler() {
+void dma_spi_handler() {
     if (dma_channel_get_irq0_status(DMA_RX_CMD_CHAN)) {
         dma_channel_acknowledge_irq0(DMA_RX_CMD_CHAN);
         // If there is an in-progress TX operation, abort it
@@ -194,6 +243,18 @@ void dma_handler() {
                 break;
         }
     }
+}
+
+void dma_adc_handler() {
+    // Retrieve the sniffer value and get DMA going again as quickly as possible
+    uint32_t adc_temp = dma_sniffer_get_data_accumulator();
+    dma_sniffer_set_data_accumulator(0);
+    dma_channel_start(DMA_ADC_CHAN);
+
+    // Scale the oversampled value to fit in a uint16
+    adc_buf[adc_idx++] = (uint16_t)(adc_temp*ADC_OVERSAMPLE_SCALE_FACTOR);
+    adc_idx %= count_of(adc_buf);
+    dma_channel_acknowledge_irq1(DMA_ADC_CHAN);
 }
 
 inline void print_raw(void* obj, size_t size) {

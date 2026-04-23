@@ -56,7 +56,8 @@ target_link_libraries(motorpressure-companion
         pico_stdlib
         hardware_spi
         hardware_pio
-        hardware_dma)
+        hardware_dma
+        hardware_adc)
 
 # Add the standard include files to the build
 target_include_directories(motorpressure-companion PRIVATE
