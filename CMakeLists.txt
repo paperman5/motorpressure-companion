@@ -54,7 +54,6 @@ pico_enable_stdio_usb(motorpressure-companion 1)
 # Add the standard library to the build
 target_link_libraries(motorpressure-companion
         pico_stdlib
-        hardware_spi
         hardware_pio
         hardware_dma
         hardware_adc)
@@ -65,6 +64,14 @@ target_include_directories(motorpressure-companion PRIVATE
 )
 
 pico_add_extra_outputs(motorpressure-companion)
+
+# In order to define the memory map, the toolchain uses a linker script located at
+# ~/.pico-sdk/sdk/2.2.0/src/rp2_common/pico_crt0/rp2040. In order to allow individual boards
+# to specify flash size, another separate linker script template is INCLUDE-d from within this script.
+# We can hijack this to specify our own flash regions if we overwrite it prior to linking. However
+# this does not give symbols that are accessible from C so the memory locations must be hardcoded.
+# See https://community.element14.com/products/raspberry-pi/b/blog/posts/raspberry-pico-c-sdk-reserve-a-flash-memory-block-for-persistent-storage
+configure_file(${CMAKE_CURRENT_LIST_DIR}/companion_flash_layout.ld ${CMAKE_BINARY_DIR}/pico_flash_region.ld)
 
 # Adjust the system clock speed
 # set(SYS_CLK_HZ 48000000)

@@ -1,7 +1,7 @@
 #pragma once
-#include "hardware/spi.h"
 #include "hardware/pio.h"
 
+#define COMPANION_ID 7u
 #define COMPANION_FETCH_RATE 99
 #define PIN_SPI_CS 9
 #define PIN_SPI_MISO 10

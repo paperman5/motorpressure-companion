@@ -2,7 +2,7 @@
 #include <string.h>
 #include "pico/stdlib.h"
 #include "companion_types.h"
-#include "hardware/spi.h"
+#include "companion_flash.h"
 #include "hardware/irq.h"
 #include "hardware/dma.h"
 #include "hardware/pio.h"
@@ -136,7 +136,7 @@ static void setup_messages() {
     memset(&setup_reply, 0, sizeof(setup_reply));
     memset(&fetch_reply, 0, sizeof(fetch_reply));
 
-    setup_reply.board_id = (uint16_t)7;
+    setup_reply.board_id = (uint16_t)COMPANION_ID;
     setup_reply.board_id_inverse = (uint16_t)~(setup_reply.board_id);
     setup_reply.channels = count_of(fetch_reply.data);
     setup_reply.update_period = COMPANION_FETCH_RATE;
