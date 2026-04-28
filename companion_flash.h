@@ -18,7 +18,9 @@ typedef struct __packed {
     uint8_t save_version;
     uint16_t sample_rate;
     uint16_t sample_count;
-    uint8_t unused[8];
+    uint16_t flcomp_serial;
+    uint16_t flcomp_flight;
+    uint8_t unused[4];
 } save_header_t;
 
 typedef struct __packed {

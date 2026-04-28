@@ -1,18 +1,20 @@
 #include <stdio.h>
 #include <string.h>
+#include <bsp/board_api.h>
+#include <tusb.h>
 #include "pico/stdlib.h"
-#include "companion_types.h"
-#include "companion_flash.h"
+#include "pico/binary_info.h"
+#include "pico/time.h"
 #include "hardware/irq.h"
 #include "hardware/dma.h"
 #include "hardware/pio.h"
-#include "hardware/structs/spi.h"
-#include "pico/binary_info.h"
-#include "motorpressure_companion.h"
-#include "pio_spi.pio.h"
-#include "pico/time.h"
-#include "pio_spi.pio.h"
 #include "hardware/adc.h"
+// #include "hardware/structs/spi.h"
+#include "pio_spi.pio.h"
+
+#include "motorpressure_companion.h"
+#include "companion_types.h"
+#include "companion_flash.h"
 
 
 altos_header_t message;
@@ -27,6 +29,13 @@ volatile uint16_t adc_idx = 0;
 
 int main()
 {
+    // Initialize TinyUSB stack
+    board_init();
+    tusb_init();
+    if (board_init_after_tusb) {
+        board_init_after_tusb();
+    }
+
     stdio_init_all();
     sleep_ms(1000);
     setup_spi();
@@ -41,7 +50,7 @@ int main()
     puts("ADC STARTED");
 
     while (true) {
-        tight_loop_contents();
+        tud_task();
     }
 }
 
@@ -255,6 +264,63 @@ void dma_adc_handler() {
     adc_buf[adc_idx++] = (uint16_t)(adc_temp*ADC_OVERSAMPLE_SCALE_FACTOR);
     adc_idx %= count_of(adc_buf);
     dma_channel_acknowledge_irq1(DMA_ADC_CHAN);
+}
+
+//--------------------------------------------------------------------+
+// Device callbacks
+//--------------------------------------------------------------------+
+
+// Invoked when device is mounted
+void tud_mount_cb(void) {
+
+}
+
+// Invoked when device is unmounted
+void tud_umount_cb(void) {
+
+}
+
+// Invoked when usb bus is suspended
+// remote_wakeup_en : if host allow us  to perform remote wakeup
+// Within 7ms, device must draw an average of current less than 2.5 mA from bus
+void tud_suspend_cb(bool remote_wakeup_en) {
+
+}
+
+// Invoked when usb bus is resumed
+void tud_resume_cb(void) {
+
+}
+
+
+//--------------------------------------------------------------------+
+// USB CDC
+//--------------------------------------------------------------------+
+void cdc_task(void) {
+    // connected and there are data available
+    if (tud_cdc_available()) {
+        // read data
+        char     buf[CFG_TUD_CDC_RX_BUFSIZE];
+        uint32_t count = tud_cdc_read(buf, sizeof(buf));
+        (void)count;
+
+        // Echo back
+        // Note: Skip echo by commenting out write() and write_flush()
+        // for throughput test e.g
+        //    $ dd if=/dev/zero of=/dev/ttyACM0 count=10000
+        // tud_cdc_write(buf, count);
+        // tud_cdc_write_flush();
+    }
+}
+
+// Invoked when cdc when line state changed e.g connected/disconnected
+void tud_cdc_line_state_cb(uint8_t itf, bool dtr, bool rts) {
+
+}
+
+// Invoked when CDC interface received data from host
+void tud_cdc_rx_cb(uint8_t itf) {
+
 }
 
 inline void print_raw(void* obj, size_t size) {

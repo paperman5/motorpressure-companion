@@ -1,5 +1,6 @@
 #pragma once
 #include "hardware/pio.h"
+#include "companion_types.h"
 
 #define COMPANION_ID 7u
 #define COMPANION_FETCH_RATE 99
