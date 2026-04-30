@@ -9,12 +9,12 @@
 #include "hardware/dma.h"
 #include "hardware/pio.h"
 #include "hardware/adc.h"
-// #include "hardware/structs/spi.h"
 #include "pio_spi.pio.h"
 
 #include "motorpressure_companion.h"
 #include "companion_types.h"
 #include "companion_flash.h"
+#include "companion_disk.h"
 
 
 altos_header_t message;
@@ -35,9 +35,15 @@ int main()
     if (board_init_after_tusb) {
         board_init_after_tusb();
     }
-
+    
     stdio_init_all();
-    sleep_ms(1000);
+    // while (!tud_cdc_connected()) {
+    //     tud_task();
+    // }
+    // for (int i = 0; i < 5; i++) {
+    //     puts("TEST");
+    // }
+    init_fat_filesystem();
     setup_spi();
     puts("SPI SETUP COMPLETE");
     setup_messages();

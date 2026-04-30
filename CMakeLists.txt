@@ -35,7 +35,9 @@ pico_sdk_init()
 
 # Add executable. Default name is the project name, version 0.1
 
-add_executable(motorpressure-companion motorpressure-companion.c usb_descriptors.c companion_disk.c)
+add_executable(motorpressure-companion motorpressure-companion.c 
+                                       usb_descriptors.c 
+                                       companion_disk.c)
 
 pico_generate_pio_header(motorpressure-companion ${CMAKE_CURRENT_LIST_DIR}/pio_spi.pio)
 

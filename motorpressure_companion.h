@@ -32,5 +32,5 @@ void setup_adc_dma();
 void spi_handler();
 void dma_spi_handler();
 void dma_adc_handler();
-inline void print_raw(void* obj, size_t size);
-inline void print_binary(int num);
+void print_raw(void* obj, size_t size);
+void print_binary(int num);
