@@ -29,6 +29,7 @@ volatile uint16_t adc_idx = 0;
 
 int main()
 {
+    init_fat_filesystem();
     // Initialize TinyUSB stack
     board_init();
     tusb_init();
@@ -37,13 +38,12 @@ int main()
     }
     
     stdio_init_all();
-    // while (!tud_cdc_connected()) {
-    //     tud_task();
-    // }
-    // for (int i = 0; i < 5; i++) {
-    //     puts("TEST");
-    // }
-    init_fat_filesystem();
+    while (!tud_cdc_connected()) {
+        tud_task();
+    }
+    for (int i = 0; i < 10; i++) {
+        puts("TEST");
+    }
     setup_spi();
     puts("SPI SETUP COMPLETE");
     setup_messages();

@@ -94,5 +94,8 @@ target_compile_definitions(motorpressure-companion PUBLIC
    PICO_STDIO_USB_RESET_RESET_TO_FLASH_DELAY_MS=100
 )
 
+# Uncomment for TinyUSB debug messages over UART (also enable uart above)
+# target_compile_definitions(motorpressure-companion PRIVATE CFG_TUSB_DEBUG=2)
+
 # Adjust the system clock speed
 # set(SYS_CLK_HZ 48000000)
