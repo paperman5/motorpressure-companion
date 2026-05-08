@@ -14,7 +14,7 @@
 #define DMA_ADC_CHAN 3
 #define ADC_CHAN 0
 #define ADC_OVERSAMPLE_COUNT 500 // Max ADC rate is 500ksps, oversample by 500 for 1ksps
-#define ADC_OVERSAMPLE_SCALE_FACTOR (float)(1<<16 - 1)/((float)(1<<12 - 1)*(float)(ADC_OVERSAMPLE_COUNT))
+#define ADC_OVERSAMPLE_SCALE_FACTOR ((float)(1<<16 - 1)/((float)(1<<12 - 1)*(float)(ADC_OVERSAMPLE_COUNT)))
 
 #define PIO_SPI_COMPANION pio0
 #define PIO_SPI_CS_SM 0

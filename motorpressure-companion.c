@@ -9,7 +9,11 @@
 #include "hardware/dma.h"
 #include "hardware/pio.h"
 #include "hardware/adc.h"
+#include "hardware/flash.h"
+#include "hardware/timer.h"
 #include "pio_spi.pio.h"
+#include "hardware/regs/usb.h"
+#include "hardware/structs/usb.h"
 
 #include "motorpressure_companion.h"
 #include "companion_types.h"
@@ -30,20 +34,30 @@ volatile uint16_t adc_idx = 0;
 int main()
 {
     init_fat_filesystem();
+    
     // Initialize TinyUSB stack
     board_init();
     tusb_init();
     if (board_init_after_tusb) {
         board_init_after_tusb();
     }
-    
     stdio_init_all();
-    while (!tud_cdc_connected()) {
-        tud_task();
+
+    // If USB is physically connected (not necessarily enumerated, etc.),
+    // wait up to 1s for a serial monitor to connect so we are sure to get messages.
+    if (usb_hw->sie_status & USB_SIE_STATUS_VBUS_DETECTED_BITS) {
+        uint32_t t1 = board_millis();
+        while (!tud_cdc_connected() && (board_millis() - t1) <= 1000) {
+            tud_task();
+        }
+        // At this point it can still miss messages and sleep_ms() doesn't fix it.
+        // Only fix seems to be calling tud_task() for a short time instead of sleeping.
+        t1 = board_millis();
+        while (board_millis() - t1 <= 10) {
+            tud_task();
+        }
     }
-    for (int i = 0; i < 10; i++) {
-        puts("TEST");
-    }
+
     setup_spi();
     puts("SPI SETUP COMPLETE");
     setup_messages();
@@ -261,7 +275,8 @@ void dma_spi_handler() {
 }
 
 void dma_adc_handler() {
-    // Retrieve the sniffer value and get DMA going again as quickly as possible
+    // Retrieve the sniffer value and get DMA going again as quickly as possible,
+    // since the ADC is free-running and we don't want to miss any samples
     uint32_t adc_temp = dma_sniffer_get_data_accumulator();
     dma_sniffer_set_data_accumulator(0);
     dma_channel_start(DMA_ADC_CHAN);

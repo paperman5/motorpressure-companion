@@ -60,6 +60,8 @@ target_link_libraries(motorpressure-companion
         hardware_pio
         hardware_dma
         hardware_adc
+        hardware_flash
+        hardware_timer
         tinyusb_device
         tinyusb_board)
 
