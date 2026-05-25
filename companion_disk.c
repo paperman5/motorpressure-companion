@@ -111,10 +111,10 @@ void init_fat_filesystem() {
   // Enumerate the files in flash
   for (uint8_t i = 0; i < COMPANION_FILE_COUNT; i++) {
     save_file_t *file = &(companion_flash_storage->files[i]);
-    if (file->header.byte1 != 0xAB || file->header.byte2 != 0xCD)
+    if (file->header.byte1 != COMPANION_FILE_HEADER_MAGIC1 || file->header.byte2 != COMPANION_FILE_HEADER_MAGIC2)
       break;
     
-    uint32_t file_size = file->header.sample_count * sizeof(data_t) + sizeof(save_header_t);
+    uint32_t file_size = MIN(file->header.sample_count * sizeof(data_t) + sizeof(save_header_t), COMPANION_FILE_SIZE);
     uint16_t first_cluster = i * FILE_CLUSTER_COUNT + 2;
     uint8_t cluster_count = (file_size + DISK_CLUSTER_SIZE - 1) / DISK_CLUSTER_SIZE;
     
@@ -140,7 +140,7 @@ void init_fat_filesystem() {
       file_size&0xFF, (file_size>>8)&0xFF, (file_size>>16)&0xFF, (file_size>>24)&0xFF
     };
     char file_name[12];
-    snprintf(file_name, sizeof(file_name), "%05d%03dBIN", file->header.flcomp_serial, file->header.flcomp_flight);
+    snprintf(file_name, sizeof(file_name), "%02d%04X%02dBIN", i, file->header.flcomp_serial, file->header.flcomp_flight);
     for (int k = strlen(file_name); k < 11; k++) {
       file_name[k] = ' ';
     }

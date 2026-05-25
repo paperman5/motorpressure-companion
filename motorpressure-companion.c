@@ -20,16 +20,26 @@
 #include "companion_flash.h"
 #include "companion_disk.h"
 
-
-altos_header_t message;
+volatile altos_header_t message;
 altos_setup_t setup_reply;
 altos_fetch_t fetch_reply;
+save_header_t save_header;
 
 uint pio_offset_cs = 0;
 uint pio_offset_data = 0;
 
-uint16_t adc_buf[128];
-volatile uint16_t adc_idx = 0;
+data_t sample_buf[2][ADC_BUFFER_COUNT];
+volatile uint8_t current_sample_buf = 0;
+volatile uint16_t buffer_index = 0;
+volatile flash_status_t flash_status = {
+    .file_index = 0,
+    .file_offset = 0,
+    .buffer_save_index = 0,
+    .do_flash_saving = false,
+    .do_single_buffer_save = false,
+    .current_flash_state = FLASH_STATE_READY
+};
+volatile bool companion_port_initialized = false;
 
 int main()
 {
@@ -69,12 +79,65 @@ int main()
     setup_adc();
     puts("ADC STARTED");
 
+#if DEBUG_NUKE_STORAGE
+    for (uint8_t i = 0; i < COMPANION_FILE_COUNT; i++) {
+        erase_file(i);
+    }
+#endif
+
+    flash_status.file_index = get_first_unused_file_index();
+    if (flash_status.file_index >= COMPANION_FILE_COUNT) {
+        puts("Storage full!");
+        flash_status.file_index = 0;
+    }
+    printf("Will save to file %d\n", flash_status.file_index);
+    if (file_needs_erased(flash_status.file_index)) {
+        printf("Erasing file %d\n", flash_status.file_index);
+        erase_file(flash_status.file_index);
+        puts("File erased");
+    }
+
+    // Physical button to start saving to flash
+    gpio_init(4);
+    gpio_set_dir(4, false);
+    gpio_set_input_enabled(4, true);
+    gpio_set_pulls(4, false, true);
+    gpio_set_irq_enabled_with_callback(4, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true, gpio_handler);
+
+    enum flash_state prev_flash_state = (enum flash_state)flash_status.current_flash_state;
+
     while (true) {
         tud_task();
+        if (prev_flash_state != flash_status.current_flash_state) {
+            // Update `prev_flash_state` before calling the change handler in case the state changes again quickly,
+            // So no state changes are missed if the change handler takes too long.
+            enum flash_state temp_prev = prev_flash_state;
+            prev_flash_state = (enum flash_state)flash_status.current_flash_state;
+            flash_state_change_handler(temp_prev, prev_flash_state);
+        }
+        if (flash_status.do_flash_saving && flash_status.do_single_buffer_save) {
+            uint8_t buffer_index = (uint8_t)flash_status.buffer_save_index;
+            if (flash_status.file_offset == 0) {
+                // Overwrite beginning of buffer with file header
+                memcpy((uint8_t *)sample_buf[buffer_index], (uint8_t *)&save_header, sizeof(save_header));
+            }
+            flash_status.file_offset += save_buffer_to_flash(flash_status.file_index, flash_status.file_offset, buffer_index);
+            if (flash_status.current_flash_state == FLASH_STATE_FINALIZING) {
+                finalize_file(flash_status.file_index);
+                flash_status.current_flash_state = FLASH_STATE_FINALIZED;
+            }
+            if (flash_status.current_flash_state == FLASH_STATE_RECORDING && flash_status.file_offset >= COMPANION_FILE_SIZE-ADC_BUFFER_SIZE) {
+                flash_status.current_flash_state = FLASH_STATE_FINALIZING;
+            }
+            flash_status.do_single_buffer_save = false;
+        }
     }
 }
 
-static void setup_pio_spi_sm(PIO pio, uint cs_sm, uint data_sm, int cs_pin, int sck_pin, int miso_pin, int mosi_pin, irq_handler_t pio_irq_handler) {
+static void setup_pio_spi_sm(PIO pio, uint cs_sm, uint data_sm, 
+                             int cs_pin, int sck_pin, int miso_pin, 
+                             int mosi_pin, irq_handler_t pio_irq_handler) 
+{
     pio_sm_claim(pio, cs_sm);
     pio_sm_claim(pio, data_sm);
     pio_offset_cs = pio_add_program(pio, &spi_cs_program);
@@ -90,7 +153,7 @@ static void setup_pio_spi_sm(PIO pio, uint cs_sm, uint data_sm, int cs_pin, int 
     sm_config_set_in_pins(&conf_data, mosi_pin);
     sm_config_set_out_pins(&conf_data, miso_pin, 1);
 
-    sm_config_set_in_shift(&conf_data, false, false, 8);
+    sm_config_set_in_shift(&conf_data, false, false, 16);
     sm_config_set_out_shift(&conf_data, false, false, 8);
     sm_config_set_out_special(&conf_data, true, false, 0);
 
@@ -123,30 +186,37 @@ static inline void reset_data_sm() {
     pio_sm_clear_fifos(PIO_SPI_COMPANION, PIO_SPI_DATA_SM);
 }
 
-static void setup_pio_spi_dma(PIO pio, uint cs_sm, uint data_sm, uint rx_cmd_chan, uint rx_msg_chan, uint tx_chan, altos_header_t *msg, irq_handler_t dma_irq_handler) {
+static void setup_pio_spi_dma(PIO pio, uint cs_sm, uint data_sm, 
+                              uint rx_cmd_chan, uint rx_msg_chan, uint tx_chan, 
+                              altos_header_t *msg, irq_handler_t dma_irq_handler) 
+{
     // 3 DMA channels:
-    // 1-Receives first header byte (command), chains immediately to #2 & configures #3
-    // 2-Receives the remaining 15 bytes of the header & chains to #3
+    // 1-Receives first two bytes (command & state), chains immediately to #2 & configures #3
+    // 2-Receives the remaining 14 bytes of the header & chains to #3
     // 3-Transmits to the flight computer with the correct message (or nothing if not needed)
+    // Note: RX size is set to 16 in order to set the message's uint16s atomically instead of
+    //       one byte at a time, so that accessing them is safe at any time.
     dma_claim_mask((1<<rx_cmd_chan) | (1<<rx_msg_chan) | (1<<tx_chan));
     
     dma_channel_config_t config = dma_channel_get_default_config(rx_cmd_chan);
-    channel_config_set_transfer_data_size(&config, DMA_SIZE_8);
+    channel_config_set_transfer_data_size(&config, DMA_SIZE_16);
     channel_config_set_dreq(&config, pio_get_dreq(pio, data_sm, false));
     channel_config_set_read_increment(&config, false);
     channel_config_set_write_increment(&config, false);
+    channel_config_set_bswap(&config, true);
     channel_config_set_chain_to(&config, rx_msg_chan);
-    dma_channel_configure(rx_cmd_chan, &config, (uint8_t *)msg, 
+    dma_channel_configure(rx_cmd_chan, &config, (uint16_t *)msg, 
                           &pio->rxf[data_sm], dma_encode_transfer_count(1), false);
 
     config = dma_channel_get_default_config(rx_msg_chan);
-    channel_config_set_transfer_data_size(&config, DMA_SIZE_8);
+    channel_config_set_transfer_data_size(&config, DMA_SIZE_16);
     channel_config_set_dreq(&config, pio_get_dreq(pio, data_sm, false));
     channel_config_set_read_increment(&config, false);
     channel_config_set_write_increment(&config, true);
+    channel_config_set_bswap(&config, true);
     channel_config_set_chain_to(&config, tx_chan);
-    dma_channel_configure(rx_msg_chan, &config, ((uint8_t *)msg) + 1, 
-                          &pio->rxf[data_sm], dma_encode_transfer_count(sizeof(message)-1), false);
+    dma_channel_configure(rx_msg_chan, &config, ((uint16_t *)msg) + 1, 
+                          &pio->rxf[data_sm], dma_encode_transfer_count(sizeof(altos_header_t)/sizeof(uint16_t) - 1), false);
 
     config = dma_channel_get_default_config(tx_chan);
     channel_config_set_transfer_data_size(&config, DMA_SIZE_8);
@@ -161,7 +231,7 @@ static void setup_pio_spi_dma(PIO pio, uint cs_sm, uint data_sm, uint rx_cmd_cha
 }
 
 static void setup_messages() {
-    memset(&message, 0, sizeof(message));
+    memset((altos_header_t *)&message, 0, sizeof(message));
     memset(&setup_reply, 0, sizeof(setup_reply));
     memset(&fetch_reply, 0, sizeof(fetch_reply));
 
@@ -185,13 +255,14 @@ static void pio_spi_stop() {
 
 void setup_spi() {
     setup_pio_spi_sm(PIO_SPI_COMPANION, PIO_SPI_CS_SM, PIO_SPI_DATA_SM, PIN_SPI_CS, PIN_SPI_SCK, PIN_SPI_MISO, PIN_SPI_MOSI, spi_handler);
-    setup_pio_spi_dma(PIO_SPI_COMPANION, PIO_SPI_CS_SM, PIO_SPI_DATA_SM, DMA_RX_CMD_CHAN, DMA_RX_MSG_CHAN, DMA_TX_CHAN, &message, dma_spi_handler);
+    setup_pio_spi_dma(PIO_SPI_COMPANION, PIO_SPI_CS_SM, PIO_SPI_DATA_SM, DMA_RX_CMD_CHAN, DMA_RX_MSG_CHAN, DMA_TX_CHAN, (altos_header_t *)&message, dma_spi_handler);
     
     bi_decl(bi_4pins_with_func(PIN_SPI_MOSI, PIN_SPI_MISO, PIN_SPI_SCK, PIN_SPI_CS, GPIO_FUNC_SPI));
 }
 
 void setup_adc() {
-    memset(adc_buf, 0, sizeof(adc_buf));
+    memset(sample_buf, 0, sizeof(sample_buf));
+
     adc_gpio_init(ADC_BASE_PIN + ADC_CHAN);
     adc_init();
     adc_select_input(ADC_CHAN);
@@ -236,16 +307,19 @@ void setup_adc_dma() {
 void spi_handler() {
     if (pio_interrupt_get(PIO_SPI_COMPANION, 0)) {
         // CS LOW
-        // puts("CS LOW");
         pio_interrupt_clear(PIO_SPI_COMPANION, 0);
-        dma_channel_set_write_addr(DMA_RX_MSG_CHAN, ((uint8_t *)&message) + 1, false);
-        dma_channel_set_write_addr(DMA_RX_CMD_CHAN, (uint8_t *)&message, true);
+        dma_channel_set_write_addr(DMA_RX_MSG_CHAN, ((uint16_t *)&message) + 1, false);
+        dma_channel_set_write_addr(DMA_RX_CMD_CHAN, (uint16_t *)&message, true);
     }
     if (pio_interrupt_get(PIO_SPI_COMPANION, 1)) {
         // CS HIGH
         pio_interrupt_clear(PIO_SPI_COMPANION, 1);
         reset_data_sm();
-        // print_raw(&message, sizeof(message));
+        if (!companion_port_initialized && message.command >= CMD_SETUP && message.command <= CMD_NOTIFY) {
+            printf("Companion message received, serial %d flight %d\n", message.serial, message.flight);
+            save_header_init();
+            companion_port_initialized = true;
+        }
     }
 }
 
@@ -282,9 +356,112 @@ void dma_adc_handler() {
     dma_channel_start(DMA_ADC_CHAN);
 
     // Scale the oversampled value to fit in a uint16
-    adc_buf[adc_idx++] = (uint16_t)(adc_temp*ADC_OVERSAMPLE_SCALE_FACTOR);
-    adc_idx %= count_of(adc_buf);
+    data_t sample = {
+        .tick = message.tick,
+        .value = (uint16_t)(adc_temp*ADC_OVERSAMPLE_SCALE_FACTOR)
+    };
+    sample_buf[current_sample_buf][buffer_index++] = sample;
+    buffer_index %= ADC_BUFFER_COUNT;
+    if (buffer_index == 0) {
+        // Hand off the save routine to the main loop so interrupts can continue
+        flash_status.buffer_save_index = current_sample_buf;
+        current_sample_buf ^= 1;
+        if (flash_status.current_flash_state == FLASH_STATE_RECORDING || flash_status.current_flash_state == FLASH_STATE_FINALIZING) {
+            flash_status.do_single_buffer_save = true;
+        }
+    }
     dma_channel_acknowledge_irq1(DMA_ADC_CHAN);
+}
+
+void gpio_handler(uint gpio, uint32_t event_mask) {
+    if (event_mask & GPIO_IRQ_EDGE_RISE) {
+        gpio_acknowledge_irq(4, GPIO_IRQ_EDGE_RISE);
+        if (flash_status.current_flash_state == FLASH_STATE_READY && companion_port_initialized) {
+            flash_status.current_flash_state = FLASH_STATE_RECORDING;
+        }
+    }
+    if (event_mask & GPIO_IRQ_EDGE_FALL) {
+        gpio_acknowledge_irq(4, GPIO_IRQ_EDGE_FALL);
+        if (flash_status.current_flash_state == FLASH_STATE_RECORDING) {
+            flash_status.current_flash_state = FLASH_STATE_FINALIZING;
+        }
+    }
+}
+
+inline void save_header_init() {
+    memset(&save_header, 0, sizeof(save_header));
+    save_header.byte1 = COMPANION_FILE_HEADER_MAGIC1;
+    save_header.byte2 = COMPANION_FILE_HEADER_MAGIC2;
+    save_header.companion_version = COMPANION_FILE_HEADER_COMPANION_VERSION;
+    save_header.save_version = COMPANION_FILE_HEADER_SAVE_VERSION;
+    save_header.sample_rate = COMPANION_FILE_HEADER_SAMPLE_RATE;
+    save_header.sample_count = 0xFFFF;
+    save_header.flcomp_serial = message.serial;
+    save_header.flcomp_flight = message.flight;
+}
+
+uint16_t save_buffer_to_flash(uint8_t file_idx, uint32_t file_offset, uint8_t buffer_idx) {
+    if (!companion_port_initialized || file_idx >= COMPANION_FILE_COUNT || file_offset + ADC_BUFFER_SIZE > COMPANION_FILE_SIZE || buffer_idx > 1)
+        return 0;
+    uint32_t file_addr = (uint32_t)&companion_flash_storage->files[file_idx];
+    // printf("%d\n", file_offset);
+    flash_range_program(file_addr + file_offset - XIP_BASE, (uint8_t *)sample_buf[buffer_idx], ADC_BUFFER_SIZE);
+    return ADC_BUFFER_SIZE;
+}
+
+void erase_file(uint8_t index) {
+    if (index >= COMPANION_FILE_COUNT)
+        return;
+    flash_range_erase((uint32_t)&(companion_flash_storage->files[index]) - XIP_BASE, COMPANION_FILE_SIZE);
+}
+
+uint8_t get_first_unused_file_index() {
+    for (uint8_t i = 0; i < COMPANION_FILE_COUNT; i++) {
+        save_file_t *file = &companion_flash_storage->files[i];
+        if (file->header.byte1 != COMPANION_FILE_HEADER_MAGIC1 || file->header.byte2 != COMPANION_FILE_HEADER_MAGIC2) {
+            return i;
+        }
+    }
+    return COMPANION_FILE_COUNT;
+}
+
+bool file_needs_erased(uint8_t file_index) {
+    // Check if the first 512 bytes are 0xFF, we will assume it has all been erased if true
+    for (uint16_t i = 0; i < 512; i++) {
+        if (*((uint8_t *)&companion_flash_storage->files[file_index] + i) != 0xFF)
+            return true;
+    }
+    return false;
+}
+
+inline void finalize_file(uint8_t file_index) {
+    // Re-save the first 256 bytes of data with the updated sample count in the header
+    uint32_t file_addr = (uint32_t)&companion_flash_storage->files[file_index];
+    uint8_t temp_buf[FLASH_PAGE_SIZE];
+    uint16_t n_samples = (uint16_t)(flash_status.file_offset/sizeof(data_t));
+    memcpy(temp_buf, &companion_flash_storage->files[file_index], FLASH_PAGE_SIZE);
+    memcpy(&temp_buf[offsetof(save_header_t, sample_count)], &n_samples, sizeof(n_samples));
+    flash_range_program(file_addr - XIP_BASE, temp_buf, FLASH_PAGE_SIZE);
+}
+
+void flash_state_change_handler(enum flash_state prev_state, enum flash_state new_state) {
+    if (new_state != prev_state + 1) {
+        printf("Invalid flash state transition: %d -> %d\n", prev_state, new_state);
+        return;
+    }
+    printf("State Transition: %d -> %d\n", prev_state, new_state);
+    switch (new_state) {
+        case FLASH_STATE_RECORDING:
+            flash_status.do_flash_saving = true;
+            break;
+        case FLASH_STATE_FINALIZING:
+            break;
+        case FLASH_STATE_FINALIZED:
+            flash_status.do_flash_saving = false;
+            break;
+        default:
+            break;
+    }
 }
 
 //--------------------------------------------------------------------+
