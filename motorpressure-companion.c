@@ -40,6 +40,8 @@ volatile flash_status_t flash_status = {
     .current_flash_state = FLASH_STATE_READY
 };
 volatile bool companion_port_initialized = false;
+volatile bool reset_pending = false;
+volatile bool overrun = false;
 
 int main()
 {
@@ -97,24 +99,14 @@ int main()
         puts("File erased");
     }
 
-    // Physical button to start saving to flash
-    gpio_init(4);
-    gpio_set_dir(4, false);
-    gpio_set_input_enabled(4, true);
-    gpio_set_pulls(4, false, true);
-    gpio_set_irq_enabled_with_callback(4, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true, gpio_handler);
-
-    enum flash_state prev_flash_state = (enum flash_state)flash_status.current_flash_state;
+    enum FlashState prev_flash_state = FLASH_STATE_READY;
+    enum FlightState prev_flight_state = FS_STARTUP;
 
     while (true) {
         tud_task();
-        if (prev_flash_state != flash_status.current_flash_state) {
-            // Update `prev_flash_state` before calling the change handler in case the state changes again quickly,
-            // So no state changes are missed if the change handler takes too long.
-            enum flash_state temp_prev = prev_flash_state;
-            prev_flash_state = (enum flash_state)flash_status.current_flash_state;
-            flash_state_change_handler(temp_prev, prev_flash_state);
-        }
+        enum FlashState flash_temp = (enum FlashState)flash_status.current_flash_state;
+        enum FlightState flight_temp = (enum FlightState)message.flight_state;
+
         if (flash_status.do_flash_saving && flash_status.do_single_buffer_save) {
             uint8_t buffer_index = (uint8_t)flash_status.buffer_save_index;
             if (flash_status.file_offset == 0) {
@@ -122,15 +114,35 @@ int main()
                 memcpy((uint8_t *)sample_buf[buffer_index], (uint8_t *)&save_header, sizeof(save_header));
             }
             flash_status.file_offset += save_buffer_to_flash(flash_status.file_index, flash_status.file_offset, buffer_index);
-            if (flash_status.current_flash_state == FLASH_STATE_FINALIZING) {
+            if (flash_temp == FLASH_STATE_FINALIZING) {
                 finalize_file(flash_status.file_index);
                 flash_status.current_flash_state = FLASH_STATE_FINALIZED;
             }
-            if (flash_status.current_flash_state == FLASH_STATE_RECORDING && flash_status.file_offset >= COMPANION_FILE_SIZE-ADC_BUFFER_SIZE) {
+            if (flash_temp == FLASH_STATE_RECORDING && flash_status.file_offset >= COMPANION_FILE_SIZE-ADC_BUFFER_SIZE) {
                 flash_status.current_flash_state = FLASH_STATE_FINALIZING;
             }
             flash_status.do_single_buffer_save = false;
         }
+
+        if (prev_flight_state != flight_temp) {
+            flight_state_change_handler(prev_flight_state, flight_temp);
+        }
+
+        if (prev_flash_state != flash_temp) {
+            flash_state_change_handler(prev_flash_state, flash_temp);
+        }
+
+        if (reset_pending && flash_temp != FLASH_STATE_RECORDING && flash_temp != FLASH_STATE_FINALIZING) {
+            software_reset();
+        }
+
+        if (overrun) {
+            puts("BUFFER OVERRUN");
+            overrun = false;
+        }
+
+        prev_flash_state = flash_temp;
+        prev_flight_state = flight_temp;
     }
 }
 
@@ -367,25 +379,13 @@ void dma_adc_handler() {
         flash_status.buffer_save_index = current_sample_buf;
         current_sample_buf ^= 1;
         if (flash_status.current_flash_state == FLASH_STATE_RECORDING || flash_status.current_flash_state == FLASH_STATE_FINALIZING) {
+            if (flash_status.do_single_buffer_save) {
+                overrun = true;
+            }
             flash_status.do_single_buffer_save = true;
         }
     }
     dma_channel_acknowledge_irq1(DMA_ADC_CHAN);
-}
-
-void gpio_handler(uint gpio, uint32_t event_mask) {
-    if (event_mask & GPIO_IRQ_EDGE_RISE) {
-        gpio_acknowledge_irq(4, GPIO_IRQ_EDGE_RISE);
-        if (flash_status.current_flash_state == FLASH_STATE_READY && companion_port_initialized) {
-            flash_status.current_flash_state = FLASH_STATE_RECORDING;
-        }
-    }
-    if (event_mask & GPIO_IRQ_EDGE_FALL) {
-        gpio_acknowledge_irq(4, GPIO_IRQ_EDGE_FALL);
-        if (flash_status.current_flash_state == FLASH_STATE_RECORDING) {
-            flash_status.current_flash_state = FLASH_STATE_FINALIZING;
-        }
-    }
 }
 
 inline void save_header_init() {
@@ -438,18 +438,54 @@ inline void finalize_file(uint8_t file_index) {
     // Re-save the first 256 bytes of data with the updated sample count in the header
     uint32_t file_addr = (uint32_t)&companion_flash_storage->files[file_index];
     uint8_t temp_buf[FLASH_PAGE_SIZE];
-    uint16_t n_samples = (uint16_t)(flash_status.file_offset/sizeof(data_t));
+    uint16_t n_samples = (uint16_t)((flash_status.file_offset - sizeof(save_header_t))/sizeof(data_t));
     memcpy(temp_buf, &companion_flash_storage->files[file_index], FLASH_PAGE_SIZE);
     memcpy(&temp_buf[offsetof(save_header_t, sample_count)], &n_samples, sizeof(n_samples));
     flash_range_program(file_addr - XIP_BASE, temp_buf, FLASH_PAGE_SIZE);
 }
 
-void flash_state_change_handler(enum flash_state prev_state, enum flash_state new_state) {
+void flight_state_change_handler(enum FlightState prev_state, enum FlightState new_state) {
+    // printf("Flight: %d -> %d\n", prev_state, new_state);
+    switch (new_state) {
+        case FS_STARTUP:
+            // Flight computer has rebooted so we should too
+            if (prev_state != FS_STARTUP) {
+                reset_pending = true;
+            }
+            break;
+        case FS_IDLE:
+            // Flight computer is flat on the desk not on a rocket
+        case FS_PAD: // (intentional fallthrough)
+            // Flight computer is ready to launch
+            flash_status.current_flash_state = FLASH_STATE_READY;
+            break;
+        case FS_BOOST:
+            // Rocket has launched
+            if (prev_state == FS_PAD && flash_status.current_flash_state == FLASH_STATE_READY) {
+                flash_status.current_flash_state = FLASH_STATE_RECORDING;
+            }
+            break;
+        case FS_FAST:
+        case FS_COAST:
+        case FS_DROGUE:
+        case FS_MAIN:
+        case FS_LANDED:
+            // Rocket motor has burned out
+            if (flash_status.current_flash_state == FLASH_STATE_RECORDING) {
+                flash_status.current_flash_state = FLASH_STATE_FINALIZING;
+            }
+            break;
+        default:
+            break;
+    }
+}
+
+void flash_state_change_handler(enum FlashState prev_state, enum FlashState new_state) {
     if (new_state != prev_state + 1) {
         printf("Invalid flash state transition: %d -> %d\n", prev_state, new_state);
         return;
     }
-    printf("State Transition: %d -> %d\n", prev_state, new_state);
+    // printf("Flash: %d -> %d\n", prev_state, new_state);
     switch (new_state) {
         case FLASH_STATE_RECORDING:
             flash_status.do_flash_saving = true;
@@ -534,4 +570,10 @@ inline void print_binary(int num) {
         printf("%d", (num>>i)&1);
     }
     printf("\n");
+}
+
+inline void software_reset() {
+    // Set the reset bit in the Application Interrupt and Reset Control Register (AIRCR)
+    // Datasheet section 2.4
+    *((volatile uint32_t*)(PPB_BASE + 0x0ED0C)) = 0x5FA0004;
 }
