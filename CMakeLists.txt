@@ -37,7 +37,8 @@ pico_sdk_init()
 
 add_executable(motorpressure-companion motorpressure-companion.c 
                                        usb_descriptors.c 
-                                       companion_disk.c)
+                                       companion_disk.c
+                                       companion_blink.c)
 
 pico_generate_pio_header(motorpressure-companion ${CMAKE_CURRENT_LIST_DIR}/pio_spi.pio)
 
@@ -57,6 +58,7 @@ pico_enable_stdio_usb(motorpressure-companion 1)
 target_link_libraries(motorpressure-companion
         pico_stdlib
         pico_unique_id
+        pico_multicore
         hardware_pio
         hardware_dma
         hardware_adc

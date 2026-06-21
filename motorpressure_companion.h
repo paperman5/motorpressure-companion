@@ -25,6 +25,7 @@ static_assert(ADC_BUFFER_SIZE % 256 == 0, "ADC buffer must be a multiple of 256 
 #define PIO_SPI_CS_SM 0
 #define PIO_SPI_DATA_SM 1
 
+void core1_main();
 static void setup_pio_spi_sm(PIO pio, uint cs_sm, uint data_sm, int cs_pin, int sck_pin, int miso_pin, int mosi_pin, irq_handler_t pio_irq_handler);
 static void reset_data_sm();
 static void setup_pio_spi_dma(PIO pio, uint cs_sm, uint data_sm, uint rx_cmd_chan, uint rx_msg_chan, uint tx_chan, altos_header_t *msg, irq_handler_t dma_irq_handler);

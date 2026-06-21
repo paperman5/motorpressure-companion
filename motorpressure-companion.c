@@ -5,6 +5,7 @@
 #include "pico/stdlib.h"
 #include "pico/binary_info.h"
 #include "pico/time.h"
+#include "pico/multicore.h"
 #include "hardware/irq.h"
 #include "hardware/dma.h"
 #include "hardware/pio.h"
@@ -19,6 +20,7 @@
 #include "companion_types.h"
 #include "companion_flash.h"
 #include "companion_disk.h"
+#include "companion_blink.h"
 
 volatile altos_header_t message;
 altos_setup_t setup_reply;
@@ -54,6 +56,8 @@ int main()
         board_init_after_tusb();
     }
     stdio_init_all();
+
+    multicore_launch_core1(core1_main);
 
     // If USB is physically connected (not necessarily enumerated, etc.),
     // wait up to 1s for a serial monitor to connect so we are sure to get messages.
@@ -99,6 +103,8 @@ int main()
         puts("File erased");
     }
 
+    change_blink_pattern(bp_companion_connection_wait);
+
     enum FlashState prev_flash_state = FLASH_STATE_READY;
     enum FlightState prev_flight_state = FS_STARTUP;
 
@@ -117,6 +123,7 @@ int main()
             if (flash_temp == FLASH_STATE_FINALIZING) {
                 finalize_file(flash_status.file_index);
                 flash_status.current_flash_state = FLASH_STATE_FINALIZED;
+                puts("File finalized and saved");
             }
             if (flash_temp == FLASH_STATE_RECORDING && flash_status.file_offset >= COMPANION_FILE_SIZE-ADC_BUFFER_SIZE) {
                 flash_status.current_flash_state = FLASH_STATE_FINALIZING;
@@ -144,6 +151,14 @@ int main()
         prev_flash_state = flash_temp;
         prev_flight_state = flight_temp;
     }
+}
+
+void core1_main() {
+    multicore_lockout_victim_init();
+    gpio_init(PICO_DEFAULT_LED_PIN);
+    gpio_set_dir(PICO_DEFAULT_LED_PIN, true);
+
+    blink_loop();
 }
 
 static void setup_pio_spi_sm(PIO pio, uint cs_sm, uint data_sm, 
@@ -331,6 +346,7 @@ void spi_handler() {
             printf("Companion message received, serial %d flight %d\n", message.serial, message.flight);
             save_header_init();
             companion_port_initialized = true;
+            change_blink_pattern(bp_companion_connected_ready);
         }
     }
 }
@@ -489,11 +505,13 @@ void flash_state_change_handler(enum FlashState prev_state, enum FlashState new_
     switch (new_state) {
         case FLASH_STATE_RECORDING:
             flash_status.do_flash_saving = true;
+            change_blink_pattern(bp_recording);
             break;
         case FLASH_STATE_FINALIZING:
             break;
         case FLASH_STATE_FINALIZED:
             flash_status.do_flash_saving = false;
+            change_blink_pattern(bp_finished);
             break;
         default:
             break;
